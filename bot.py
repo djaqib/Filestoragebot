@@ -501,7 +501,45 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "⏸️ Paused — videos you send now won't be saved until you /collect or /fav again."
         )
+async def create_share(share_type: str, target: str, created_by: int):
+    while True:
+        code = generate_share_code()
 
+        def _insert(conn):
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO shared_links
+                    (share_code, share_type, target, created_by)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (share_code) DO NOTHING
+                    RETURNING share_code
+                    """,
+                    (code, share_type, target, created_by),
+                )
+                row = cur.fetchone()
+                return row[0] if row else None
+
+        result = await db_run(_insert)
+
+        if result:
+            return result
+
+
+async def get_share(code: str):
+    def _query(conn):
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT share_type, target, downloads
+                FROM shared_links
+                WHERE share_code=%s
+                """,
+                (code,),
+            )
+            return cur.fetchone()
+
+    return await db_run(_query)
 
 # ---------------------------------------------------------------------------
 # Video handling
