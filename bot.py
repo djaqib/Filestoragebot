@@ -356,7 +356,7 @@ HELP_TEXT = (
     "/stop \\- Cancel a running /get, and pause incoming videos until /collect or /fav\n"
     "/current \\- Show which collection\\(s\\) are active\n"
     "/list \\- List all collections and how many videos each has\n"
-    "/get `<name>` \\- Send back every video in a collection, in albums of 10\n"
+    "/get `<name>` `[page]` \\- Send back a collection's videos, in albums of 10 \\(optionally starting at a page\\)\n"
     "/remove \\- Reply to a video I sent with this to delete just that one\n"
     "/rename `<old> -> <new>` \\- Rename a collection\n"
     "/merge `<a> -> <b>` \\- Move all videos from a into b, then remove a\n"
@@ -712,7 +712,7 @@ async def _get_collection_impl(
 
     if name is None:
         if not context.args:
-            await update.effective_message.reply_text("Usage: /get <name>")
+            await update.effective_message.reply_text("Usage: /get <name> [page]")
             return
         name = normalize_name(" ".join(context.args))
 
@@ -736,6 +736,13 @@ async def _get_collection_impl(
 
     total = len(rows)
     total_pages = (total + GET_PAGE_SIZE - 1) // GET_PAGE_SIZE
+
+    # Clamp an out-of-range requested page (e.g. "/get default 999" on a
+    # collection that only has 38 pages) to the last valid page instead of
+    # producing an empty/negative slice.
+    if offset >= total:
+        offset = max(0, (total_pages - 1) * GET_PAGE_SIZE)
+
     page_num = offset // GET_PAGE_SIZE + 1
     total_albums = (total + ALBUM_SIZE - 1) // ALBUM_SIZE
     page_end = min(offset + GET_PAGE_SIZE, total)
@@ -801,11 +808,29 @@ async def _get_collection_impl(
 
 async def get_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+
+    # Optional trailing page number, e.g. "/get default 28" jumps straight to
+    # page 28 instead of starting from page 1. Useful if pagination ever gets
+    # stuck on a previous run and you don't want to click "Next page" 27 times.
+    args = list(context.args) if context.args else []
+    offset = 0
+    if args and args[-1].isdigit():
+        page = max(1, int(args[-1]))
+        offset = (page - 1) * GET_PAGE_SIZE
+        args = args[:-1]
+    context.args = args  # remaining args are just the collection name
+
     try:
-        await run_cancellable(chat_id, _get_collection_impl(update, context))
+        await run_cancellable(chat_id, _get_collection_impl(update, context, offset=offset))
     except asyncio.CancelledError:
         await update.effective_message.reply_text(
             "🛑 Stopped — albums already sent stay sent, nothing else will go out."
+        )
+    except Exception:
+        logger.exception("Unexpected error while sending collection")
+        await update.effective_message.reply_text(
+            "⚠️ Something went wrong partway through — some albums may have sent. "
+            "Try /get <name> <page> to resume from where it stopped."
         )
 
 
