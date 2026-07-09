@@ -225,6 +225,16 @@ def init_db():
                     SELECT MIN(id) FROM videos GROUP BY LOWER(collection), file_unique_id
                 )
             """)
+            cur.execute("""
+    CREATE TABLE IF NOT EXISTS shared_links (
+        share_code TEXT PRIMARY KEY,
+        share_type TEXT NOT NULL DEFAULT 'collection',
+        target TEXT NOT NULL,
+        created_by BIGINT NOT NULL,
+        downloads INTEGER DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+""")
             cur.execute("UPDATE videos SET collection = LOWER(collection) WHERE collection != LOWER(collection)")
             cur.execute("UPDATE sent_videos SET collection = LOWER(collection) WHERE collection != LOWER(collection)")
     _db_call(_init)
