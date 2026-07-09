@@ -1,3 +1,5 @@
+import secrets
+import string
 import os
 import io
 import time
@@ -76,7 +78,9 @@ def normalize_name(name: str) -> str:
     in-memory state (active_collections, etc)."""
     return name.strip().lower()
 
-
+def generate_share_code(length: int = 10) -> str:
+    alphabet = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(length))
 # ---------------------------------------------------------------------------
 # Access control — this bot is for personal use only. Every update (command,
 # video, button press) passes through here first, before any other handler
