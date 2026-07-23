@@ -44,15 +44,6 @@ ALLOWED_USER_IDS = {int(uid.strip()) for uid in _raw_allowed.split(",") if uid.s
 if not ALLOWED_USER_IDS:
     raise RuntimeError("ALLOWED_USER_IDS is set but empty — refusing to start with no allowed users.")
 
-# Optional: a private channel (bot must be an admin) that every incoming video
-# gets forwarded into as a backup. This decouples the actual file content from
-# this bot's token — if the bot ever gets banned, migrate.py can re-mint fresh
-# file_ids for a new bot token by forwarding each video out of this channel.
-# Set to the channel's numeric ID (looks like -100xxxxxxxxxx). Leave unset to
-# disable the vault feature entirely — everything else works the same without it.
-_raw_vault = os.environ.get("VAULT_CHAT_ID", "").strip()
-VAULT_CHAT_ID = int(_raw_vault) if _raw_vault else None
-
 # Default collection name used until the user sets one with /collect
 DEFAULT_COLLECTION = "default"
 
@@ -126,10 +117,7 @@ async def access_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Simple connection pool so we don't open a fresh TCP/TLS handshake to Neon on
 # every single message (Neon cold starts are fast, but no need to pay it twice).
-db_pool = psycopg2.pool.SimpleConnectionPool(
-    1, 5, DATABASE_URL, sslmode="require",
-    keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3,
-)
+db_pool = psycopg2.pool.SimpleConnectionPool(1, 5, DATABASE_URL, sslmode="require")
 
 # Tracks which collection(s) each chat is currently adding videos to.
 # Resets to [DEFAULT_COLLECTION] on bot restart; persisted videos themselves
@@ -142,6 +130,16 @@ active_collections: dict[int, list[str]] = {}
 # automatically the next time /collect, /fav, or /finish is used, since
 # setting a new active collection is a clear signal you're starting again.
 paused_chats: set[int] = set()
+
+# Chats currently in "remove mode" (/removemode on): incoming videos are
+# matched against the active collection(s) by file_unique_id and deleted
+# rather than saved. This lets you delete many videos by just forwarding
+# them, without needing to reply to each one individually with /remove.
+# Takes priority over paused_chats (deleting is a deliberate action, so a
+# prior /stop pause shouldn't block it). Cleared by /removemode off, or
+# automatically when /collect, /fav, or /finish changes the active
+# collection(s), same as paused_chats.
+removing_chats: set[int] = set()
 
 # Per-chat in-memory batch state for debounced "Saved" replies.
 # Each entry: {"saved": [...names...], "skipped": [...names...], "errors": int, "task": asyncio.Task}
@@ -182,39 +180,17 @@ async def run_cancellable(chat_id: int, coro):
 
 def _db_call(fn):
     """Run a blocking DB function against a pooled connection. Meant to be
-    wrapped in asyncio.to_thread() by callers so it never blocks the event loop.
-
-    Neon (and most managed Postgres free tiers) will silently kill idle
-    connections — Neon specifically suspends its compute after a few minutes
-    of inactivity, which drops every pooled connection at once. The pool has
-    no way to know a connection died server-side, so it'll hand out a dead
-    one. We detect that (OperationalError/InterfaceError), discard the dead
-    connection instead of returning it to the pool, and retry once with a
-    brand-new connection — which also has the side effect of waking Neon
-    back up if it had suspended.
-    """
+    wrapped in asyncio.to_thread() by callers so it never blocks the event loop."""
     conn = db_pool.getconn()
     try:
         result = fn(conn)
         conn.commit()
-        db_pool.putconn(conn)
         return result
-    except (psycopg2.OperationalError, psycopg2.InterfaceError):
-        logger.warning("DB connection was stale/closed — discarding it and retrying once")
-        db_pool.putconn(conn, close=True)
-        conn = db_pool.getconn()
-        try:
-            result = fn(conn)
-            conn.commit()
-            db_pool.putconn(conn)
-            return result
-        except Exception:
-            db_pool.putconn(conn, close=True)
-            raise
     except Exception:
         conn.rollback()
-        db_pool.putconn(conn)
         raise
+    finally:
+        db_pool.putconn(conn)
 
 
 async def db_run(fn):
@@ -235,13 +211,6 @@ def init_db():
                     added_at TIMESTAMPTZ DEFAULT NOW(),
                     UNIQUE (collection, file_unique_id)
                 )
-            """)
-            # Records which message in the vault channel backs up this video,
-            # so migrate.py can re-fetch it under a new bot token if this bot
-            # ever gets banned. NULL for videos saved before the vault feature
-            # was enabled, or if the forward-to-vault step failed at save time.
-            cur.execute("""
-                ALTER TABLE videos ADD COLUMN IF NOT EXISTS vault_message_id BIGINT
             """)
             # Maps a bot-sent message (chat_id, message_id) back to the
             # collection + video it came from, so /remove can work via reply.
@@ -381,6 +350,72 @@ def _queue_batch_result(chat_id: int, context: ContextTypes.DEFAULT_TYPE, *,
 
 
 # ---------------------------------------------------------------------------
+# Batched "deleted" replies for /removemode (same debounce pattern as the
+# save-batch above, kept separate so the two message types can't get mixed
+# up in one summary).
+# ---------------------------------------------------------------------------
+
+_delete_batch_state: dict[int, dict] = {}
+
+
+async def _flush_delete_batch(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    await asyncio.sleep(BATCH_DEBOUNCE_SECONDS)
+
+    state = _delete_batch_state.get(chat_id)
+    if state is None or state["task"] is not asyncio.current_task():
+        return
+
+    _delete_batch_state.pop(chat_id, None)
+
+    lines = []
+    if state["deleted"]:
+        by_collection: dict[str, int] = {}
+        for col in state["deleted"]:
+            by_collection[col] = by_collection.get(col, 0) + 1
+        parts = ", ".join(f"{n} from '{col}'" for col, n in by_collection.items())
+        lines.append(f"🗑️ Deleted {len(state['deleted'])} video(s): {parts}")
+
+    if state["not_found"]:
+        by_collection = {}
+        for col in state["not_found"]:
+            by_collection[col] = by_collection.get(col, 0) + 1
+        parts = ", ".join(f"{n} in '{col}'" for col, n in by_collection.items())
+        lines.append(
+            f"⚠️ {len(state['not_found'])} video(s) weren't found (already gone or never saved there): {parts}"
+        )
+
+    if state["errors"]:
+        lines.append(f"❌ {state['errors']} video(s) failed to delete due to a database error.")
+
+    if not lines:
+        return
+
+    try:
+        await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
+    except TelegramError:
+        logger.exception("Failed to send delete batch summary to chat %s", chat_id)
+
+
+def _queue_delete_batch_result(chat_id: int, context: ContextTypes.DEFAULT_TYPE, *,
+                                deleted: str | None = None, not_found: str | None = None, error: bool = False):
+    state = _delete_batch_state.get(chat_id)
+    if state is None:
+        state = {"deleted": [], "not_found": [], "errors": 0, "task": None}
+        _delete_batch_state[chat_id] = state
+
+    if deleted:
+        state["deleted"].append(deleted)
+    if not_found:
+        state["not_found"].append(not_found)
+    if error:
+        state["errors"] += 1
+
+    if state["task"] is not None and not state["task"].done():
+        state["task"].cancel()
+    state["task"] = asyncio.create_task(_flush_delete_batch(chat_id, context))
+
+
+# ---------------------------------------------------------------------------
 # Help text
 # ---------------------------------------------------------------------------
 
@@ -395,9 +430,10 @@ HELP_TEXT = (
     "/fav \\- Shortcut for /collect favorites\n"
     "/finish \\- Stop adding to the active collection \\(resets to default\\)\n"
     "/stop \\- Cancel a running /get, and pause incoming videos until /collect or /fav\n"
+    "/removemode `on|off` \\- While on, videos you send/forward are deleted from the active collection\\(s\\) instead of saved\n"
     "/current \\- Show which collection\\(s\\) are active\n"
     "/list \\- List all collections and how many videos each has\n"
-    "/get `<name>` \\- Send back every video in a collection, in albums of 10\n"
+    "/get `<name>` `[page]` \\- Send back a collection's videos, in albums of 10 \\(optionally starting at a page\\)\n"
     "/remove \\- Reply to a video I sent with this to delete just that one\n"
     "/rename `<old> -> <new>` \\- Rename a collection\n"
     "/merge `<a> -> <b>` \\- Move all videos from a into b, then remove a\n"
@@ -438,6 +474,7 @@ async def _set_active_collections(update: Update, chat_id: int, names: list[str]
 
     active_collections[chat_id] = names
     paused_chats.discard(chat_id)  # setting an active collection resumes saving if /stop paused it
+    removing_chats.discard(chat_id)  # switching collections exits remove mode too
     if len(names) == 1:
         await update.message.reply_text(f"📁 Active collection set to: {names[0]}")
     else:
@@ -483,7 +520,12 @@ async def fav_shortcut(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def current(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     names = get_active_collections(chat_id)
-    suffix = " (⏸️ paused — incoming videos are not being saved)" if chat_id in paused_chats else ""
+    if chat_id in removing_chats:
+        suffix = " (🗑️ remove mode — incoming videos are being deleted, not saved)"
+    elif chat_id in paused_chats:
+        suffix = " (⏸️ paused — incoming videos are not being saved)"
+    else:
+        suffix = ""
     await update.message.reply_text(f"📁 Active collection(s): {', '.join(names)}{suffix}")
 
 
@@ -492,6 +534,7 @@ async def finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     previous = get_active_collections(chat_id)
     active_collections.pop(chat_id, None)
     paused_chats.discard(chat_id)
+    removing_chats.discard(chat_id)
     await update.message.reply_text(
         f"✅ Finished with '{', '.join(previous)}'. Active collection reset to '{DEFAULT_COLLECTION}'.\n"
         f"Use /collect <name> before sending more videos to start a new one."
@@ -530,13 +573,43 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def removemode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/removemode on|off — while on, videos you send or forward are deleted
+    from the currently active collection(s) instead of saved, matched by
+    file_unique_id. This works for ANY video (not just ones the bot sent via
+    /get), which is the point: it lets you bulk-delete by just forwarding a
+    batch of videos, mirroring how the normal save flow works via /collect."""
+    chat_id = update.effective_chat.id
+    arg = context.args[0].lower().strip() if context.args else ""
+
+    if arg in ("off", "stop"):
+        was_on = chat_id in removing_chats
+        removing_chats.discard(chat_id)
+        if was_on:
+            await update.message.reply_text("✅ Remove mode off — videos you send will be saved normally again.")
+        else:
+            await update.message.reply_text("Remove mode wasn't on.")
+        return
+
+    if arg and arg != "on":
+        await update.message.reply_text("Usage: /removemode on|off")
+        return
+
+    active = get_active_collections(chat_id)
+    removing_chats.add(chat_id)
+    paused_chats.discard(chat_id)  # remove mode takes priority over a paused state
+    await update.message.reply_text(
+        f"🗑️ Remove mode ON — send or forward videos and I'll delete them from: {', '.join(active)}\n"
+        f"(Only from the currently active collection(s), even if a video exists elsewhere too.)\n"
+        f"Use /removemode off when done."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Video handling
 # ---------------------------------------------------------------------------
 
-async def _save_video_to_collection(
-    collection: str, file_id: str, file_unique_id: str, vault_message_id: int | None = None
-) -> bool:
+async def _save_video_to_collection(collection: str, file_id: str, file_unique_id: str) -> bool:
     """Returns True if inserted (new), False if it was a duplicate.
     Normalizes the collection name here as a final safety net so a
     non-lowercased name can never reach the DB regardless of call site."""
@@ -546,37 +619,34 @@ async def _save_video_to_collection(
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO videos (collection, file_id, file_unique_id, vault_message_id)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO videos (collection, file_id, file_unique_id)
+                VALUES (%s, %s, %s)
                 ON CONFLICT (collection, file_unique_id) DO NOTHING
                 RETURNING id
                 """,
-                (collection, file_id, file_unique_id, vault_message_id),
+                (collection, file_id, file_unique_id),
             )
             return cur.fetchone() is not None
     return await db_run(_insert)
 
 
-async def _existing_vault_message_id(file_unique_id: str) -> int | None:
-    """If this exact file is already backed up in the vault (under any
-    collection), return that vault message id instead of forwarding again."""
-    def _query(conn):
+async def _delete_video_from_collection(collection: str, file_unique_id: str) -> bool:
+    """Returns True if a row was deleted, False if it wasn't found in that
+    collection. Used by /removemode; mirrors _save_video_to_collection above."""
+    collection = normalize_name(collection)
+
+    def _delete(conn):
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT vault_message_id FROM videos WHERE file_unique_id = %s "
-                "AND vault_message_id IS NOT NULL LIMIT 1",
-                (file_unique_id,),
+                "DELETE FROM videos WHERE collection = %s AND file_unique_id = %s",
+                (collection, file_unique_id),
             )
-            row = cur.fetchone()
-            return row[0] if row else None
-    return await db_run(_query)
+            return cur.rowcount > 0
+    return await db_run(_delete)
 
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-
-    if chat_id in paused_chats:
-        return  # /stop was used — silently ignore until /collect or /fav resumes saving
 
     video = update.message.video
     if video is not None:
@@ -586,32 +656,33 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         doc = update.message.document
         file_id, file_unique_id = doc.file_id, doc.file_unique_id
 
-    # Back the file up to the vault channel — but only once per physical file.
-    # If this exact video is already backed up under another collection, reuse
-    # that vault message instead of creating a duplicate copy in the channel.
-    vault_message_id = None
-    if VAULT_CHAT_ID is not None:
-        try:
-            vault_message_id = await _existing_vault_message_id(file_unique_id)
-        except Exception:
-            logger.exception("DB error checking existing vault entry for %s", file_unique_id)
-
-        if vault_message_id is None:
+    if chat_id in removing_chats:
+        # /removemode: delete this video from the active collection(s) only,
+        # even if it also exists in other collections — checked and confirmed
+        # scoping, not a limitation.
+        collections = get_active_collections(chat_id)
+        for collection in collections:
             try:
-                vault_msg = await context.bot.forward_message(
-                    chat_id=VAULT_CHAT_ID,
-                    from_chat_id=chat_id,
-                    message_id=update.message.message_id,
-                )
-                vault_message_id = vault_msg.message_id
-            except TelegramError:
-                logger.exception("Failed to forward video to vault channel (chat_id=%s)", VAULT_CHAT_ID)
+                was_deleted = await _delete_video_from_collection(collection, file_unique_id)
+            except Exception:
+                logger.exception("DB error deleting video from '%s'", collection)
+                _queue_delete_batch_result(chat_id, context, error=True)
+                continue
+
+            if was_deleted:
+                _queue_delete_batch_result(chat_id, context, deleted=collection)
+            else:
+                _queue_delete_batch_result(chat_id, context, not_found=collection)
+        return
+
+    if chat_id in paused_chats:
+        return  # /stop was used — silently ignore until /collect or /fav resumes saving
 
     collections = get_active_collections(chat_id)
 
     for collection in collections:
         try:
-            inserted = await _save_video_to_collection(collection, file_id, file_unique_id, vault_message_id)
+            inserted = await _save_video_to_collection(collection, file_id, file_unique_id)
         except Exception:
             logger.exception("DB error saving video to '%s'", collection)
             _queue_batch_result(chat_id, context, error=True)
@@ -646,6 +717,24 @@ async def handle_non_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 # /list
 # ---------------------------------------------------------------------------
+
+async def list_set_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tapping a collection button under /list sets it as the active
+    collection — equivalent to /collect <name> but without typing it out.
+    Reserved-name checks (RESERVED_NAMES) don't apply here: the collection
+    already exists in the DB (that's why it's listed), so tapping it is a
+    switch, not a creation of a new collection under a reserved word."""
+    query = update.callback_query
+    name = query.data[len("listset:"):]
+    chat_id = update.effective_chat.id
+
+    active_collections[chat_id] = [name]
+    paused_chats.discard(chat_id)
+    removing_chats.discard(chat_id)
+
+    await query.answer(f"📁 Active: {name}")
+    await context.bot.send_message(chat_id=chat_id, text=f"📁 Active collection set to: {name}")
+
 
 async def list_collections(update: Update, context: ContextTypes.DEFAULT_TYPE):
     search = None
@@ -695,7 +784,25 @@ async def list_collections(update: Update, context: ContextTypes.DEFAULT_TYPE):
             next_args = f"{search + ' ' if search else ''}{page + 1}"
             footer = f"\n\nUse /list {next_args} for the next page."
 
-    await update.message.reply_text(f"{header}:\n" + "\n".join(lines) + footer)
+    await update.message.reply_text(
+        f"{header}:\n" + "\n".join(lines) + footer,
+        reply_markup=InlineKeyboardMarkup(_build_list_set_buttons(page_rows)),
+    )
+
+
+def _build_list_set_buttons(page_rows) -> list:
+    """One button per collection on this /list page; tapping it sets that
+    collection active (same as /collect <name>), so you don't have to type
+    the command out. Skips a collection if its name would push callback_data
+    over Telegram's 64-byte limit (silently — the text listing above always
+    still shows it, /collect <name> still works to set it manually)."""
+    buttons = []
+    for name, count in page_rows:
+        data = f"listset:{name}"
+        if len(data.encode("utf-8")) > 64:
+            continue
+        buttons.append([InlineKeyboardButton(f"📁 {name} ({count})", callback_data=data)])
+    return buttons
 
 
 # ---------------------------------------------------------------------------
@@ -728,11 +835,13 @@ async def _send_page(
     album_offset = offset // ALBUM_SIZE
 
     sent_records = []
+    album_statuses = []  # list of (local_album_num, success: bool), one per album in this page
     last_sent_messages = None
 
     for album_idx, i in enumerate(range(0, len(page_rows), ALBUM_SIZE)):
         batch = page_rows[i: i + ALBUM_SIZE]
         global_album_num = album_offset + album_idx + 1
+        local_album_num = album_idx + 1
         caption = f"📼 Album {global_album_num}/{total_albums_overall} • Page {page_num}/{total_pages}"
 
         media_group = [
@@ -768,6 +877,8 @@ async def _send_page(
                 )
                 break
 
+        album_statuses.append((local_album_num, bool(last_sent_messages)))
+
         if last_sent_messages:
             for msg, (_, file_unique_id) in zip(last_sent_messages, batch):
                 sent_records.append((msg.message_id, file_unique_id))
@@ -777,7 +888,62 @@ async def _send_page(
         # between albums. See ALBUM_DELAY_SECONDS near the top of the file.
         await asyncio.sleep(ALBUM_DELAY_SECONDS)
 
-    return sent_records
+    return sent_records, album_statuses
+
+
+# How many page-jump number buttons to show in a row, and how many pages
+# ahead of the current one to include in the numbered grid before falling
+# back to the bigger "jump ahead" shortcuts.
+PAGE_JUMP_GRID_COLUMNS = 5
+PAGE_JUMP_WINDOW_SIZE = 15
+# Extra "jump ahead" shortcuts shown after the numbered grid, e.g. from page 1
+# these render as "→21" and "→51" (current page + these offsets) — lets you
+# leap far ahead without a giant grid, similar to jumping straight to page 50
+# then getting a fresh "→100" shortcut from there.
+PAGE_JUMP_AHEAD_OFFSETS = (20, 50)
+
+
+def _register_jump_token(chat_id: int, name: str, rows: list, target_page: int) -> str:
+    offset = (target_page - 1) * GET_PAGE_SIZE
+    token = f"{chat_id}:{name}:{offset}"
+    _pending_pages[token] = {"name": name, "offset": offset, "rows": rows}
+    return token
+
+
+def _build_page_jump_rows(chat_id: int, name: str, rows: list, page_num: int, total_pages: int) -> list:
+    """Grid of tappable page numbers starting at the current page (current
+    page marked with dots), plus one or two 'jump ahead' shortcuts beyond the
+    grid. Reuses the same getpage: callback as the existing Next-page button,
+    just with a different target offset registered under a fresh token."""
+    if total_pages <= 1:
+        return []
+
+    window_start = page_num
+    window_end = min(page_num + PAGE_JUMP_WINDOW_SIZE - 1, total_pages)
+
+    page_buttons = []
+    for p in range(window_start, window_end + 1):
+        token = _register_jump_token(chat_id, name, rows, p)
+        label = f"·{p}·" if p == page_num else str(p)
+        page_buttons.append(InlineKeyboardButton(label, callback_data=f"getpage:{token}"))
+
+    grid_rows = [
+        page_buttons[i:i + PAGE_JUMP_GRID_COLUMNS]
+        for i in range(0, len(page_buttons), PAGE_JUMP_GRID_COLUMNS)
+    ]
+
+    jump_ahead_row = []
+    for delta in PAGE_JUMP_AHEAD_OFFSETS:
+        target = page_num + delta
+        if target > total_pages or target <= window_end:
+            continue
+        token = _register_jump_token(chat_id, name, rows, target)
+        jump_ahead_row.append(InlineKeyboardButton(f"→{target}", callback_data=f"getpage:{token}"))
+
+    if jump_ahead_row:
+        grid_rows.append(jump_ahead_row)
+
+    return grid_rows
 
 
 async def _get_collection_impl(
@@ -791,7 +957,7 @@ async def _get_collection_impl(
 
     if name is None:
         if not context.args:
-            await update.effective_message.reply_text("Usage: /get <name>")
+            await update.effective_message.reply_text("Usage: /get <name> [page]")
             return
         name = normalize_name(" ".join(context.args))
 
@@ -815,6 +981,13 @@ async def _get_collection_impl(
 
     total = len(rows)
     total_pages = (total + GET_PAGE_SIZE - 1) // GET_PAGE_SIZE
+
+    # Clamp an out-of-range requested page (e.g. "/get default 999" on a
+    # collection that only has 38 pages) to the last valid page instead of
+    # producing an empty/negative slice.
+    if offset >= total:
+        offset = max(0, (total_pages - 1) * GET_PAGE_SIZE)
+
     page_num = offset // GET_PAGE_SIZE + 1
     total_albums = (total + ALBUM_SIZE - 1) // ALBUM_SIZE
     page_end = min(offset + GET_PAGE_SIZE, total)
@@ -827,7 +1000,7 @@ async def _get_collection_impl(
         f"(send /stop to cancel)"
     )
 
-    sent_records = await _send_page(
+    sent_records, album_statuses = await _send_page(
         chat_id=chat_id,
         name=name,
         rows=rows,
@@ -858,20 +1031,50 @@ async def _get_collection_impl(
         except Exception:
             logger.exception("Failed to record sent_videos for '%s'", name)
 
+    # Row of numbered buttons showing per-album send status for this page —
+    # one button per album (10 videos each), ✅ if that album's media group
+    # sent successfully, ❌ if it failed (e.g. an expired file_id). Purely
+    # informational: tapping one just shows its status, it doesn't do anything.
+    STATUS_BUTTONS_PER_ROW = 8
+    status_buttons = [
+        InlineKeyboardButton(
+            f"{num}✅" if ok else f"{num}❌",
+            callback_data=f"getalbumstatus:{page_num}:{num}:{'ok' if ok else 'fail'}",
+        )
+        for num, ok in album_statuses
+    ]
+    status_rows = [
+        status_buttons[i:i + STATUS_BUTTONS_PER_ROW]
+        for i in range(0, len(status_buttons), STATUS_BUTTONS_PER_ROW)
+    ]
+
+    jump_rows = _build_page_jump_rows(chat_id, name, rows, page_num, total_pages)
+
     next_offset = offset + GET_PAGE_SIZE
     if next_offset >= total:
         await update.effective_message.reply_text(f"✅ Done — all {total} video(s) from '{name}' sent.")
+        if status_rows:
+            await update.effective_message.reply_text(
+                f"Album status for page {page_num} (tap a number for details):",
+                reply_markup=InlineKeyboardMarkup(status_rows),
+            )
+        if jump_rows:
+            await update.effective_message.reply_text(
+                f"Jump to a page of '{name}' ({total_pages} pages total):",
+                reply_markup=InlineKeyboardMarkup(jump_rows),
+            )
     else:
         remaining = total - next_offset
         token = f"{chat_id}:{name}:{next_offset}"
         _pending_pages[token] = {"name": name, "offset": next_offset, "rows": rows}
-        keyboard = InlineKeyboardMarkup([[
+        nav_row = [
             InlineKeyboardButton(
                 f"▶️ Next page ({remaining} video(s) left)",
                 callback_data=f"getpage:{token}",
             ),
             InlineKeyboardButton("🛑 Stop here", callback_data=f"getstop:{chat_id}"),
-        ]])
+        ]
+        keyboard = InlineKeyboardMarkup(status_rows + jump_rows + [nav_row])
         await update.effective_message.reply_text(
             f"⏸ Page {page_num}/{total_pages} done — tap to load the next page.",
             reply_markup=keyboard,
@@ -880,12 +1083,41 @@ async def _get_collection_impl(
 
 async def get_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+
+    # Optional trailing page number, e.g. "/get default 28" jumps straight to
+    # page 28 instead of starting from page 1. Useful if pagination ever gets
+    # stuck on a previous run and you don't want to click "Next page" 27 times.
+    args = list(context.args) if context.args else []
+    offset = 0
+    if args and args[-1].isdigit():
+        page = max(1, int(args[-1]))
+        offset = (page - 1) * GET_PAGE_SIZE
+        args = args[:-1]
+    context.args = args  # remaining args are just the collection name
+
     try:
-        await run_cancellable(chat_id, _get_collection_impl(update, context))
+        await run_cancellable(chat_id, _get_collection_impl(update, context, offset=offset))
     except asyncio.CancelledError:
         await update.effective_message.reply_text(
             "🛑 Stopped — albums already sent stay sent, nothing else will go out."
         )
+    except Exception:
+        logger.exception("Unexpected error while sending collection")
+        await update.effective_message.reply_text(
+            "⚠️ Something went wrong partway through — some albums may have sent. "
+            "Try /get <name> <page> to resume from where it stopped."
+        )
+
+
+async def get_album_status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles taps on the numbered per-album status buttons under a /get
+    page. Purely informational — shows a toast, changes nothing."""
+    query = update.callback_query
+    _, page_num, album_num, status = query.data.split(":")
+    if status == "ok":
+        await query.answer(f"Album {album_num} (page {page_num}): sent successfully ✅")
+    else:
+        await query.answer(f"Album {album_num} (page {page_num}): failed to send ❌ — file may have expired", show_alert=True)
 
 
 async def get_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1466,6 +1698,7 @@ async def post_init(application: Application):
         BotCommand("fav", "Shortcut for /collect favorites"),
         BotCommand("finish", "Stop adding to active collection"),
         BotCommand("stop", "Cancel whatever is currently running"),
+        BotCommand("removemode", "Toggle bulk-delete-by-forwarding mode"),
         BotCommand("current", "Show the active collection(s)"),
         BotCommand("list", "List all collections"),
         BotCommand("get", "Send back a collection's videos"),
@@ -1496,6 +1729,7 @@ def main():
     application.add_handler(CommandHandler("fav", fav_shortcut))
     application.add_handler(CommandHandler("finish", finish))
     application.add_handler(CommandHandler("stop", stop_command))
+    application.add_handler(CommandHandler("removemode", removemode_command))
     application.add_handler(CommandHandler("current", current))
     application.add_handler(CommandHandler("list", list_collections))
     application.add_handler(CommandHandler("get", get_collection))
@@ -1511,6 +1745,8 @@ def main():
 
     application.add_handler(CallbackQueryHandler(delete_callback, pattern=r"^del(confirm|cancel):"))
     application.add_handler(CallbackQueryHandler(get_page_callback, pattern=r"^get(page|stop):"))
+    application.add_handler(CallbackQueryHandler(get_album_status_callback, pattern=r"^getalbumstatus:"))
+    application.add_handler(CallbackQueryHandler(list_set_callback, pattern=r"^listset:"))
 
     application.add_handler(MessageHandler(filters.VIDEO, handle_video))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
