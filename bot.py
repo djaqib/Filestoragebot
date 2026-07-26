@@ -6,6 +6,10 @@ import logging
 import random
 import psycopg2
 from psycopg2 import pool
+import uvicorn
+from starlette.applications import Starlette
+from starlette.responses import PlainTextResponse, Response
+from starlette.routing import Route
 from telegram import (
     Update,
     BotCommand,
@@ -1838,7 +1842,32 @@ async def post_init(application: Application):
     ])
 
 
-def main():
+async def telegram_webhook(request):
+    """Receives Telegram's POST to /webhook. We're no longer using PTB's
+    built-in webhook server (which validated the secret token for us), so we
+    check the X-Telegram-Bot-Api-Secret-Token header ourselves before
+    accepting anything, then hand the parsed Update off to the Application's
+    internal update queue exactly like the built-in server did."""
+    application = request.app.state.application
+
+    secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+    if secret_header != WEBHOOK_SECRET:
+        logger.warning("Rejected webhook POST with missing/invalid secret token header")
+        return Response(status_code=401)
+
+    data = await request.json()
+    update = Update.de_json(data=data, bot=application.bot)
+    await application.update_queue.put(update)
+    return Response(status_code=200)
+
+
+async def health_check(request):
+    """Plain 200 OK for uptime monitors (e.g. UptimeRobot) — no auth, no
+    Telegram-specific logic, just confirms the process is up and serving."""
+    return PlainTextResponse("OK")
+
+
+async def run():
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     # Access control runs first, in group -1, ahead of every other handler
@@ -1880,13 +1909,33 @@ def main():
         handle_non_video,
     ))
 
-    application.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        secret_token=WEBHOOK_SECRET,
-        webhook_url=f"{RENDER_EXTERNAL_URL}/webhook",
-        url_path="webhook",
+    web_app = Starlette(routes=[
+        Route("/webhook", telegram_webhook, methods=["POST"]),
+        Route("/health", health_check, methods=["GET", "HEAD"]),
+    ])
+    web_app.state.application = application
+
+    server = uvicorn.Server(
+        uvicorn.Config(app=web_app, host="0.0.0.0", port=PORT, log_level="info")
     )
+
+    # async with application: calls application.initialize() on entry (which
+    # runs post_init -> init_db() and set_my_commands(), same as before) and
+    # application.shutdown() on exit.
+    async with application:
+        await application.bot.set_webhook(
+            url=f"{RENDER_EXTERNAL_URL}/webhook",
+            secret_token=WEBHOOK_SECRET,
+        )
+        await application.start()
+        try:
+            await server.serve()
+        finally:
+            await application.stop()
+
+
+def main():
+    asyncio.run(run())
 
 
 if __name__ == "__main__":
