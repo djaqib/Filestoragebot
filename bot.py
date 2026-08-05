@@ -673,56 +673,83 @@ async def _save_video_to_collection(
         save; it's just surfaced in the batch summary so you can /remove it
         yourself if you agree it's a repeat.
     Normalizes the collection name here as a final safety net so a
-    non-lowercased name can never reach the DB regardless of call site."""
+    non-lowercased name can never reach the DB regardless of call site.
+    
+    Gracefully handles missing duration/file_size columns: if the migration
+    hasn't run yet (columns don't exist), it will save without them and log
+    a warning to run the migration manually."""
     collection = normalize_name(collection)
 
     def _insert(conn):
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO videos (collection, file_id, file_unique_id, duration, file_size)
-                VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT (collection, file_unique_id) DO NOTHING
-                RETURNING id
-                """,
-                (collection, file_id, file_unique_id, duration, file_size),
-            )
-            inserted = cur.fetchone() is not None
+            # Try inserting with duration and file_size first (if migration ran)
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO videos (collection, file_id, file_unique_id, duration, file_size)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (collection, file_unique_id) DO NOTHING
+                    RETURNING id
+                    """,
+                    (collection, file_id, file_unique_id, duration, file_size),
+                )
+                inserted = cur.fetchone() is not None
 
-            possible_near_dup = False
-            if inserted and file_size is not None:
-                if duration is not None:
-                    low = file_size * (1 - NEAR_DUP_SIZE_TOLERANCE_FRACTION)
-                    high = file_size * (1 + NEAR_DUP_SIZE_TOLERANCE_FRACTION)
+                possible_near_dup = False
+                if inserted and file_size is not None:
+                    if duration is not None:
+                        low = file_size * (1 - NEAR_DUP_SIZE_TOLERANCE_FRACTION)
+                        high = file_size * (1 + NEAR_DUP_SIZE_TOLERANCE_FRACTION)
+                        cur.execute(
+                            """
+                            SELECT 1 FROM videos
+                            WHERE collection = %s
+                              AND file_unique_id != %s
+                              AND duration IS NOT NULL
+                              AND ABS(duration - %s) <= %s
+                              AND file_size BETWEEN %s AND %s
+                            LIMIT 1
+                            """,
+                            (collection, file_unique_id, duration,
+                             NEAR_DUP_DURATION_TOLERANCE_SECONDS, low, high),
+                        )
+                    else:
+                        low = file_size * (1 - NEAR_DUP_SIZE_ONLY_TOLERANCE_FRACTION)
+                        high = file_size * (1 + NEAR_DUP_SIZE_ONLY_TOLERANCE_FRACTION)
+                        cur.execute(
+                            """
+                            SELECT 1 FROM videos
+                            WHERE collection = %s
+                              AND file_unique_id != %s
+                              AND file_size BETWEEN %s AND %s
+                            LIMIT 1
+                            """,
+                            (collection, file_unique_id, low, high),
+                        )
+                    possible_near_dup = cur.fetchone() is not None
+
+                return inserted, possible_near_dup
+            except Exception as e:
+                if "duration" in str(e) or "file_size" in str(e):
+                    # Migration hasn't run yet — fall back to saving without those columns
+                    logger.warning(
+                        "Columns duration/file_size don't exist yet (migration pending). "
+                        "Saving without them. Run: ALTER TABLE videos ADD COLUMN IF NOT EXISTS duration INTEGER; "
+                        "ALTER TABLE videos ADD COLUMN IF NOT EXISTS file_size BIGINT;"
+                    )
                     cur.execute(
                         """
-                        SELECT 1 FROM videos
-                        WHERE collection = %s
-                          AND file_unique_id != %s
-                          AND duration IS NOT NULL
-                          AND ABS(duration - %s) <= %s
-                          AND file_size BETWEEN %s AND %s
-                        LIMIT 1
+                        INSERT INTO videos (collection, file_id, file_unique_id)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (collection, file_unique_id) DO NOTHING
+                        RETURNING id
                         """,
-                        (collection, file_unique_id, duration,
-                         NEAR_DUP_DURATION_TOLERANCE_SECONDS, low, high),
+                        (collection, file_id, file_unique_id),
                     )
+                    inserted = cur.fetchone() is not None
+                    return inserted, False  # no near-dup detection without the columns
                 else:
-                    low = file_size * (1 - NEAR_DUP_SIZE_ONLY_TOLERANCE_FRACTION)
-                    high = file_size * (1 + NEAR_DUP_SIZE_ONLY_TOLERANCE_FRACTION)
-                    cur.execute(
-                        """
-                        SELECT 1 FROM videos
-                        WHERE collection = %s
-                          AND file_unique_id != %s
-                          AND file_size BETWEEN %s AND %s
-                        LIMIT 1
-                        """,
-                        (collection, file_unique_id, low, high),
-                    )
-                possible_near_dup = cur.fetchone() is not None
-
-            return inserted, possible_near_dup
+                    raise  # re-raise if it's a different kind of error
     return await db_run(_insert)
 
 
