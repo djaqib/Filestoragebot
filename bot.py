@@ -228,6 +228,19 @@ def init_db():
                 )
             """)
 
+            # Duration (seconds) and file size (bytes), used only for the
+            # "near duplicate" heuristic in _save_video_to_collection — we
+            # can't inspect actual video content (Telegram's Bot API caps
+            # file downloads at 20MB), so this is the closest lightweight
+            # signal for "this might be the same file re-uploaded." Both are
+            # nullable: document-uploaded videos don't carry a duration, and
+            # rows saved before this feature existed have neither.
+            cur.execute("ALTER TABLE videos ADD COLUMN IF NOT EXISTS duration INTEGER")
+            cur.execute("ALTER TABLE videos ADD COLUMN IF NOT EXISTS file_size BIGINT")
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_videos_collection_filesize ON videos (collection, file_size)"
+            )
+
             # One-time migration: collection names used to be case-sensitive,
             # so 'Mix' and 'mix' could exist as separate collections. Fold
             # everything down to lowercase now. Where two case-variants would
@@ -321,6 +334,17 @@ async def _flush_batch(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         parts = ", ".join(f"{n} in '{col}'" for col, n in by_collection.items())
         lines.append(f"⚠️ Skipped {len(state['skipped'])} duplicate(s): {parts}")
 
+    if state["near_dups"]:
+        by_collection = {}
+        for col in state["near_dups"]:
+            by_collection[col] = by_collection.get(col, 0) + 1
+        parts = ", ".join(f"{n} in '{col}'" for col, n in by_collection.items())
+        lines.append(
+            f"🔎 {len(state['near_dups'])} possible near-duplicate(s) saved (similar duration/size to "
+            f"an existing video, but not an exact match): {parts}. Worth a look — reply /remove on one "
+            f"if it turns out to be a repeat."
+        )
+
     if state["errors"]:
         lines.append(f"❌ {state['errors']} video(s) failed to save due to a database error.")
 
@@ -334,14 +358,17 @@ async def _flush_batch(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _queue_batch_result(chat_id: int, context: ContextTypes.DEFAULT_TYPE, *,
-                         saved: str | None = None, skipped: str | None = None, error: bool = False):
+                         saved: str | None = None, skipped: str | None = None,
+                         error: bool = False, near_dup: bool = False):
     state = _batch_state.get(chat_id)
     if state is None:
-        state = {"saved": [], "skipped": [], "errors": 0, "task": None}
+        state = {"saved": [], "skipped": [], "errors": 0, "near_dups": [], "task": None}
         _batch_state[chat_id] = state
 
     if saved:
         state["saved"].append(saved)
+        if near_dup:
+            state["near_dups"].append(saved)
     if skipped:
         state["skipped"].append(skipped)
     if error:
@@ -428,7 +455,10 @@ HELP_TEXT = (
     "Send or forward videos and I'll save them into named collections\\. "
     "Video files sent as documents work too\\. Duplicate videos within "
     "the same collection are skipped automatically\\. Collection names are "
-    "not case\\-sensitive \\('Mix' and 'mix' are the same collection\\)\\.\n\n"
+    "not case\\-sensitive \\('Mix' and 'mix' are the same collection\\)\\. "
+    "If a saved video's duration and file size closely match another video "
+    "already in the collection, I'll flag it as a possible near\\-duplicate "
+    "\\(not an exact match, so it's saved either way — just a heads\\-up\\)\\.\n\n"
     "*Commands:*\n"
     "/collect `<name>` or `<a>, <b>` \\- Set the active collection\\(s\\)\n"
     "/fav \\- Shortcut for /collect favorites\n"
@@ -613,8 +643,35 @@ async def removemode_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # Video handling
 # ---------------------------------------------------------------------------
 
-async def _save_video_to_collection(collection: str, file_id: str, file_unique_id: str) -> bool:
-    """Returns True if inserted (new), False if it was a duplicate.
+# Tolerances for the "near duplicate" heuristic. We can't inspect actual
+# video content (Telegram's Bot API caps file downloads at 20MB, so most
+# saved videos aren't analyzable), so this flags — never auto-skips — a
+# fresh save whose duration and file size are both suspiciously close to
+# another video already in the same collection. Usually means the same file
+# got re-uploaded under a new file_id (e.g. forwarded via a different chat,
+# which changes file_unique_id even though the bytes are identical).
+NEAR_DUP_DURATION_TOLERANCE_SECONDS = 2
+NEAR_DUP_SIZE_TOLERANCE_FRACTION = 0.02  # 2%
+# Fallback when duration isn't available (document uploads don't carry one)
+# — tighter size-only tolerance since we've lost a signal.
+NEAR_DUP_SIZE_ONLY_TOLERANCE_FRACTION = 0.005  # 0.5%
+
+
+async def _save_video_to_collection(
+    collection: str,
+    file_id: str,
+    file_unique_id: str,
+    duration: int | None = None,
+    file_size: int | None = None,
+) -> tuple[bool, bool]:
+    """Returns (inserted, possible_near_dup).
+      - inserted: True if this was a new row, False if an exact duplicate
+        (same file_unique_id) already existed in this collection.
+      - possible_near_dup: only meaningful when inserted is True — True if
+        another video already in this collection has a duration and file
+        size within NEAR_DUP_* tolerance of this one. This never blocks the
+        save; it's just surfaced in the batch summary so you can /remove it
+        yourself if you agree it's a repeat.
     Normalizes the collection name here as a final safety net so a
     non-lowercased name can never reach the DB regardless of call site."""
     collection = normalize_name(collection)
@@ -623,14 +680,49 @@ async def _save_video_to_collection(collection: str, file_id: str, file_unique_i
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO videos (collection, file_id, file_unique_id)
-                VALUES (%s, %s, %s)
+                INSERT INTO videos (collection, file_id, file_unique_id, duration, file_size)
+                VALUES (%s, %s, %s, %s, %s)
                 ON CONFLICT (collection, file_unique_id) DO NOTHING
                 RETURNING id
                 """,
-                (collection, file_id, file_unique_id),
+                (collection, file_id, file_unique_id, duration, file_size),
             )
-            return cur.fetchone() is not None
+            inserted = cur.fetchone() is not None
+
+            possible_near_dup = False
+            if inserted and file_size is not None:
+                if duration is not None:
+                    low = file_size * (1 - NEAR_DUP_SIZE_TOLERANCE_FRACTION)
+                    high = file_size * (1 + NEAR_DUP_SIZE_TOLERANCE_FRACTION)
+                    cur.execute(
+                        """
+                        SELECT 1 FROM videos
+                        WHERE collection = %s
+                          AND file_unique_id != %s
+                          AND duration IS NOT NULL
+                          AND ABS(duration - %s) <= %s
+                          AND file_size BETWEEN %s AND %s
+                        LIMIT 1
+                        """,
+                        (collection, file_unique_id, duration,
+                         NEAR_DUP_DURATION_TOLERANCE_SECONDS, low, high),
+                    )
+                else:
+                    low = file_size * (1 - NEAR_DUP_SIZE_ONLY_TOLERANCE_FRACTION)
+                    high = file_size * (1 + NEAR_DUP_SIZE_ONLY_TOLERANCE_FRACTION)
+                    cur.execute(
+                        """
+                        SELECT 1 FROM videos
+                        WHERE collection = %s
+                          AND file_unique_id != %s
+                          AND file_size BETWEEN %s AND %s
+                        LIMIT 1
+                        """,
+                        (collection, file_unique_id, low, high),
+                    )
+                possible_near_dup = cur.fetchone() is not None
+
+            return inserted, possible_near_dup
     return await db_run(_insert)
 
 
@@ -655,10 +747,13 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     video = update.message.video
     if video is not None:
         file_id, file_unique_id = video.file_id, video.file_unique_id
+        duration, file_size = video.duration, video.file_size
     else:
         # A "document" that is actually a video (mime type video/* or .mp4/.mov/etc).
+        # Documents don't carry a duration field, only file_size.
         doc = update.message.document
         file_id, file_unique_id = doc.file_id, doc.file_unique_id
+        duration, file_size = None, doc.file_size
 
     if chat_id in removing_chats:
         # /removemode: delete this video from the active collection(s) only,
@@ -686,14 +781,16 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for collection in collections:
         try:
-            inserted = await _save_video_to_collection(collection, file_id, file_unique_id)
+            inserted, possible_near_dup = await _save_video_to_collection(
+                collection, file_id, file_unique_id, duration, file_size
+            )
         except Exception:
             logger.exception("DB error saving video to '%s'", collection)
             _queue_batch_result(chat_id, context, error=True)
             continue
 
         if inserted:
-            _queue_batch_result(chat_id, context, saved=collection)
+            _queue_batch_result(chat_id, context, saved=collection, near_dup=possible_near_dup)
         else:
             _queue_batch_result(chat_id, context, skipped=collection)
 
