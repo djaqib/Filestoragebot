@@ -1911,34 +1911,37 @@ async def neardupes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         def _query(conn):
             with conn.cursor() as cur:
-                # Find videos that have potential near-dupes in this collection.
-                # A video V1 is flagged if there exists another video V2 in the
-                # same collection where:
+                # Find all videos involved in near-dup pairs: both the flagged videos
+                # (V1 with a match partner) AND their match partners (V2s). This way
+                # the user can see the full comparison pairs when fetching.
+                # A video V1 has a potential near-dup match V2 if:
                 #   - both have file_size (not null)
                 #   - if both have duration: ABS(V1.duration - V2.duration) <= 2 seconds
                 #     AND file_size within 2%
                 #   - if only one has duration: file_size within 0.5%
                 cur.execute(
                     """
-                    SELECT DISTINCT v1.file_id, v1.file_unique_id, v1.duration, v1.file_size, v1.added_at
-                    FROM videos v1
-                    WHERE v1.collection = %s
-                      AND v1.file_size IS NOT NULL
-                      AND EXISTS (
+                    SELECT DISTINCT v.file_id, v.file_unique_id
+                    FROM videos v
+                    WHERE v.collection = %s
+                      AND v.file_size IS NOT NULL
+                      AND (
+                        EXISTS (
                           SELECT 1 FROM videos v2
-                          WHERE v2.collection = v1.collection
-                            AND v2.file_unique_id != v1.file_unique_id
+                          WHERE v2.collection = v.collection
+                            AND v2.file_unique_id != v.file_unique_id
                             AND v2.file_size IS NOT NULL
                             AND (
-                              (v1.duration IS NOT NULL AND v2.duration IS NOT NULL
-                               AND ABS(v1.duration - v2.duration) <= 2
-                               AND v2.file_size BETWEEN v1.file_size * 0.98 AND v1.file_size * 1.02)
+                              (v.duration IS NOT NULL AND v2.duration IS NOT NULL
+                               AND ABS(v.duration - v2.duration) <= 2
+                               AND v2.file_size BETWEEN v.file_size * 0.98 AND v.file_size * 1.02)
                               OR
-                              (v1.duration IS NULL OR v2.duration IS NULL
-                               AND v2.file_size BETWEEN v1.file_size * 0.995 AND v1.file_size * 1.005)
+                              (v.duration IS NULL OR v2.duration IS NULL
+                               AND v2.file_size BETWEEN v.file_size * 0.995 AND v.file_size * 1.005)
                             )
+                        )
                       )
-                    ORDER BY v1.added_at DESC
+                    ORDER BY v.added_at DESC
                     """,
                     (name,),
                 )
@@ -1957,20 +1960,99 @@ async def neardupes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     token = f"{update.effective_chat.id}:{name}"
     _pending_neardupes[token] = {"name": name, "rows": rows}
     keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton(f"📤 Fetch {len(rows)} near-dup(s)", callback_data=f"neardupes:{token}"),
+        InlineKeyboardButton(f"📤 Fetch {len(rows)} video(s)", callback_data=f"neardupes:{token}"),
     ]])
     await update.message.reply_text(
-        f"🔎 Found {len(rows)} near-duplicate video(s) in '{name}' "
-        f"(similar duration/size to other videos in the collection):\n\n"
-        f"Tap the button below to fetch them all at once, then use /remove "
-        f"to delete any that are actually repeats.",
+        f"🔎 Found {len(rows)} video(s) involved in near-duplicate pairs in '{name}'.\n\n"
+        f"These are videos with similar duration/file size that might be repeats. "
+        f"Tap the button to fetch them all — you'll see the potential duplicate pairs together "
+        f"so you can compare and decide which to /remove.",
         reply_markup=keyboard,
     )
 
 
+# Token storage for near-dup delete operations (maps token to {collection, file_unique_id})
+_neardup_deletes: dict[str, dict] = {}
+
+
+async def _send_neardupes_individually(
+    chat_id: int,
+    name: str,
+    rows: list,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    """Send near-dup videos one at a time with an individual delete button
+    for each, instead of in albums. This lets users delete specific videos
+    without needing to use /remove."""
+    sent = 0
+    failed = 0
+
+    for fid, file_unique_id in rows:
+        try:
+            # Generate a token for this specific delete operation
+            token = f"{chat_id}:{name}:{file_unique_id}"
+            _neardup_deletes[token] = {"collection": name, "file_unique_id": file_unique_id}
+
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🗑️ Delete this", callback_data=f"neardup_delete:{token}"),
+            ]])
+
+            await context.bot.send_video(
+                chat_id=chat_id,
+                video=fid,
+                caption=f"Near-dup in '{name}' — tap the button to delete it, or reply /remove to keep it.",
+                reply_markup=keyboard,
+            )
+            sent += 1
+            await asyncio.sleep(0.5)  # small gap between sends
+        except TelegramError:
+            logger.exception("Failed to send near-dup video file_unique_id=%s", file_unique_id)
+            failed += 1
+
+    summary = f"📤 Sent {sent} near-dup video(s)"
+    if failed:
+        summary += f" ({failed} failed to send)"
+    summary += ". Tap the delete button to remove any, or use /remove to keep them."
+    await context.bot.send_message(chat_id=chat_id, text=summary)
+
+
+async def neardup_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Delete a near-dup video directly via the inline button."""
+    query = update.callback_query
+    token = query.data[len("neardup_delete:"):]
+    delete_info = _neardup_deletes.pop(token, None)
+
+    if delete_info is None:
+        await query.answer("⏱️ This button has expired.")
+        return
+
+    collection = delete_info["collection"]
+    file_unique_id = delete_info["file_unique_id"]
+
+    try:
+        def _delete(conn):
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM videos WHERE collection = %s AND file_unique_id = %s",
+                    (collection, file_unique_id),
+                )
+                return cur.rowcount
+        deleted = await db_run(_delete)
+    except Exception:
+        logger.exception("DB error deleting near-dup video from '%s'", collection)
+        await query.answer("⚠️ Couldn't delete — database error.", show_alert=True)
+        return
+
+    if deleted:
+        await query.answer(f"🗑️ Deleted from '{collection}'")
+        await query.edit_message_text("🗑️ Deleted.")
+    else:
+        await query.answer("⚠️ Already deleted or not found.", show_alert=True)
+
+
 async def neardupes_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Callback for the 'Fetch near-dupes' button — sends them back just like
-    /get does, but only the flagged videos."""
+    """Callback for the 'Fetch near-dupes' button — sends them individually
+    with a delete button under each one."""
     query = update.callback_query
     token = query.data[len("neardupes:"):]
     state = _pending_neardupes.pop(token, None)
@@ -1989,18 +2071,18 @@ async def neardupes_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     try:
         await run_cancellable(
             chat_id,
-            _get_collection_impl(update, context, name=name, offset=0, rows=rows),
+            _send_neardupes_individually(chat_id, name, rows, context),
         )
     except asyncio.CancelledError:
         await context.bot.send_message(
             chat_id=chat_id,
-            text="🛑 Stopped — albums already sent stay sent, nothing else will go out.",
+            text="🛑 Stopped — videos already sent stay sent.",
         )
     except Exception:
         logger.exception("Unexpected error while sending near-dupes for '%s'", name)
         await context.bot.send_message(
             chat_id=chat_id,
-            text="⚠️ Something went wrong loading the near-dupes. Try /neardupes again.",
+            text="⚠️ Something went wrong sending the near-dupes. Try /neardupes again.",
         )
 
 
@@ -2144,6 +2226,7 @@ async def run():
     application.add_handler(CallbackQueryHandler(list_set_callback, pattern=r"^listset:"))
     application.add_handler(CallbackQueryHandler(list_get_callback, pattern=r"^listget:"))
     application.add_handler(CallbackQueryHandler(neardupes_callback, pattern=r"^neardupes:"))
+    application.add_handler(CallbackQueryHandler(neardup_delete_callback, pattern=r"^neardup_delete:"))
 
     application.add_handler(MessageHandler(filters.VIDEO, handle_video))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
