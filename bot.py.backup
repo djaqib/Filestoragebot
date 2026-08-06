@@ -6,6 +6,10 @@ import logging
 import random
 import psycopg2
 from psycopg2 import pool
+import uvicorn
+from starlette.applications import Starlette
+from starlette.responses import PlainTextResponse, Response
+from starlette.routing import Route
 from telegram import (
     Update,
     BotCommand,
@@ -224,6 +228,19 @@ def init_db():
                 )
             """)
 
+            # Duration (seconds) and file size (bytes), used only for the
+            # "near duplicate" heuristic in _save_video_to_collection — we
+            # can't inspect actual video content (Telegram's Bot API caps
+            # file downloads at 20MB), so this is the closest lightweight
+            # signal for "this might be the same file re-uploaded." Both are
+            # nullable: document-uploaded videos don't carry a duration, and
+            # rows saved before this feature existed have neither.
+            cur.execute("ALTER TABLE videos ADD COLUMN IF NOT EXISTS duration INTEGER")
+            cur.execute("ALTER TABLE videos ADD COLUMN IF NOT EXISTS file_size BIGINT")
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_videos_collection_filesize ON videos (collection, file_size)"
+            )
+
             # One-time migration: collection names used to be case-sensitive,
             # so 'Mix' and 'mix' could exist as separate collections. Fold
             # everything down to lowercase now. Where two case-variants would
@@ -317,6 +334,17 @@ async def _flush_batch(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         parts = ", ".join(f"{n} in '{col}'" for col, n in by_collection.items())
         lines.append(f"⚠️ Skipped {len(state['skipped'])} duplicate(s): {parts}")
 
+    if state["near_dups"]:
+        by_collection = {}
+        for col in state["near_dups"]:
+            by_collection[col] = by_collection.get(col, 0) + 1
+        parts = ", ".join(f"{n} in '{col}'" for col, n in by_collection.items())
+        lines.append(
+            f"🔎 {len(state['near_dups'])} possible near-duplicate(s) saved (similar duration/size to "
+            f"an existing video, but not an exact match): {parts}. Worth a look — reply /remove on one "
+            f"if it turns out to be a repeat."
+        )
+
     if state["errors"]:
         lines.append(f"❌ {state['errors']} video(s) failed to save due to a database error.")
 
@@ -330,14 +358,17 @@ async def _flush_batch(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _queue_batch_result(chat_id: int, context: ContextTypes.DEFAULT_TYPE, *,
-                         saved: str | None = None, skipped: str | None = None, error: bool = False):
+                         saved: str | None = None, skipped: str | None = None,
+                         error: bool = False, near_dup: bool = False):
     state = _batch_state.get(chat_id)
     if state is None:
-        state = {"saved": [], "skipped": [], "errors": 0, "task": None}
+        state = {"saved": [], "skipped": [], "errors": 0, "near_dups": [], "task": None}
         _batch_state[chat_id] = state
 
     if saved:
         state["saved"].append(saved)
+        if near_dup:
+            state["near_dups"].append(saved)
     if skipped:
         state["skipped"].append(skipped)
     if error:
@@ -424,7 +455,10 @@ HELP_TEXT = (
     "Send or forward videos and I'll save them into named collections\\. "
     "Video files sent as documents work too\\. Duplicate videos within "
     "the same collection are skipped automatically\\. Collection names are "
-    "not case\\-sensitive \\('Mix' and 'mix' are the same collection\\)\\.\n\n"
+    "not case\\-sensitive \\('Mix' and 'mix' are the same collection\\)\\. "
+    "If a saved video's duration and file size closely match another video "
+    "already in the collection, I'll flag it as a possible near\\-duplicate "
+    "\\(not an exact match, so it's saved either way — just a heads\\-up\\)\\.\n\n"
     "*Commands:*\n"
     "/collect `<name>` or `<a>, <b>` \\- Set the active collection\\(s\\)\n"
     "/fav \\- Shortcut for /collect favorites\n"
@@ -442,6 +476,7 @@ HELP_TEXT = (
     "/delete `<name>` \\- Permanently delete a collection and its videos\n"
     "/status \\- Show video count in the active collection\\(s\\)\n"
     "/random `<name>` \\- Send back one random video from a collection\n"
+    "/neardupes `<name>` \\- List near-duplicate videos in a collection, with a button to fetch them\n"
     "/stats \\- Show overall stats across all collections\n"
     "/help \\- Show this help message"
 )
@@ -609,24 +644,113 @@ async def removemode_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # Video handling
 # ---------------------------------------------------------------------------
 
-async def _save_video_to_collection(collection: str, file_id: str, file_unique_id: str) -> bool:
-    """Returns True if inserted (new), False if it was a duplicate.
+# Tolerances for the "near duplicate" heuristic. We can't inspect actual
+# video content (Telegram's Bot API caps file downloads at 20MB, so most
+# saved videos aren't analyzable), so this flags — never auto-skips — a
+# fresh save whose duration and file size are both suspiciously close to
+# another video already in the same collection. Usually means the same file
+# got re-uploaded under a new file_id (e.g. forwarded via a different chat,
+# which changes file_unique_id even though the bytes are identical).
+NEAR_DUP_DURATION_TOLERANCE_SECONDS = 2
+NEAR_DUP_SIZE_TOLERANCE_FRACTION = 0.02  # 2%
+# Fallback when duration isn't available (document uploads don't carry one)
+# — tighter size-only tolerance since we've lost a signal.
+NEAR_DUP_SIZE_ONLY_TOLERANCE_FRACTION = 0.005  # 0.5%
+
+
+async def _save_video_to_collection(
+    collection: str,
+    file_id: str,
+    file_unique_id: str,
+    duration: int | None = None,
+    file_size: int | None = None,
+) -> tuple[bool, bool]:
+    """Returns (inserted, possible_near_dup).
+      - inserted: True if this was a new row, False if an exact duplicate
+        (same file_unique_id) already existed in this collection.
+      - possible_near_dup: only meaningful when inserted is True — True if
+        another video already in this collection has a duration and file
+        size within NEAR_DUP_* tolerance of this one. This never blocks the
+        save; it's just surfaced in the batch summary so you can /remove it
+        yourself if you agree it's a repeat.
     Normalizes the collection name here as a final safety net so a
-    non-lowercased name can never reach the DB regardless of call site."""
+    non-lowercased name can never reach the DB regardless of call site.
+    
+    Gracefully handles missing duration/file_size columns: if the migration
+    hasn't run yet (columns don't exist), it will save without them and log
+    a warning to run the migration manually."""
     collection = normalize_name(collection)
 
     def _insert(conn):
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO videos (collection, file_id, file_unique_id)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (collection, file_unique_id) DO NOTHING
-                RETURNING id
-                """,
-                (collection, file_id, file_unique_id),
-            )
-            return cur.fetchone() is not None
+            # Try inserting with duration and file_size first (if migration ran)
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO videos (collection, file_id, file_unique_id, duration, file_size)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (collection, file_unique_id) DO NOTHING
+                    RETURNING id
+                    """,
+                    (collection, file_id, file_unique_id, duration, file_size),
+                )
+                inserted = cur.fetchone() is not None
+
+                possible_near_dup = False
+                if inserted and file_size is not None:
+                    if duration is not None:
+                        low = file_size * (1 - NEAR_DUP_SIZE_TOLERANCE_FRACTION)
+                        high = file_size * (1 + NEAR_DUP_SIZE_TOLERANCE_FRACTION)
+                        cur.execute(
+                            """
+                            SELECT 1 FROM videos
+                            WHERE collection = %s
+                              AND file_unique_id != %s
+                              AND duration IS NOT NULL
+                              AND ABS(duration - %s) <= %s
+                              AND file_size BETWEEN %s AND %s
+                            LIMIT 1
+                            """,
+                            (collection, file_unique_id, duration,
+                             NEAR_DUP_DURATION_TOLERANCE_SECONDS, low, high),
+                        )
+                    else:
+                        low = file_size * (1 - NEAR_DUP_SIZE_ONLY_TOLERANCE_FRACTION)
+                        high = file_size * (1 + NEAR_DUP_SIZE_ONLY_TOLERANCE_FRACTION)
+                        cur.execute(
+                            """
+                            SELECT 1 FROM videos
+                            WHERE collection = %s
+                              AND file_unique_id != %s
+                              AND file_size BETWEEN %s AND %s
+                            LIMIT 1
+                            """,
+                            (collection, file_unique_id, low, high),
+                        )
+                    possible_near_dup = cur.fetchone() is not None
+
+                return inserted, possible_near_dup
+            except Exception as e:
+                if "duration" in str(e) or "file_size" in str(e):
+                    # Migration hasn't run yet — fall back to saving without those columns
+                    logger.warning(
+                        "Columns duration/file_size don't exist yet (migration pending). "
+                        "Saving without them. Run: ALTER TABLE videos ADD COLUMN IF NOT EXISTS duration INTEGER; "
+                        "ALTER TABLE videos ADD COLUMN IF NOT EXISTS file_size BIGINT;"
+                    )
+                    cur.execute(
+                        """
+                        INSERT INTO videos (collection, file_id, file_unique_id)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (collection, file_unique_id) DO NOTHING
+                        RETURNING id
+                        """,
+                        (collection, file_id, file_unique_id),
+                    )
+                    inserted = cur.fetchone() is not None
+                    return inserted, False  # no near-dup detection without the columns
+                else:
+                    raise  # re-raise if it's a different kind of error
     return await db_run(_insert)
 
 
@@ -651,10 +775,13 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     video = update.message.video
     if video is not None:
         file_id, file_unique_id = video.file_id, video.file_unique_id
+        duration, file_size = video.duration, video.file_size
     else:
         # A "document" that is actually a video (mime type video/* or .mp4/.mov/etc).
+        # Documents don't carry a duration field, only file_size.
         doc = update.message.document
         file_id, file_unique_id = doc.file_id, doc.file_unique_id
+        duration, file_size = None, doc.file_size
 
     if chat_id in removing_chats:
         # /removemode: delete this video from the active collection(s) only,
@@ -682,14 +809,16 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for collection in collections:
         try:
-            inserted = await _save_video_to_collection(collection, file_id, file_unique_id)
+            inserted, possible_near_dup = await _save_video_to_collection(
+                collection, file_id, file_unique_id, duration, file_size
+            )
         except Exception:
             logger.exception("DB error saving video to '%s'", collection)
             _queue_batch_result(chat_id, context, error=True)
             continue
 
         if inserted:
-            _queue_batch_result(chat_id, context, saved=collection)
+            _queue_batch_result(chat_id, context, saved=collection, near_dup=possible_near_dup)
         else:
             _queue_batch_result(chat_id, context, skipped=collection)
 
@@ -718,12 +847,27 @@ async def handle_non_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # /list
 # ---------------------------------------------------------------------------
 
+async def list_choice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tapping a collection button under /list — instead of assuming what you
+    want, shows a small menu: set it active, or immediately fetch its videos
+    (same as /get <name>)."""
+    query = update.callback_query
+    name = query.data[len("listchoice:"):]
+    await query.answer()
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📁 Set active", callback_data=f"listset:{name}"),
+        InlineKeyboardButton("📤 Get videos", callback_data=f"listget:{name}"),
+    ]])
+    await query.edit_message_text(f"'{name}' — what would you like to do?", reply_markup=keyboard)
+
+
 async def list_set_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Tapping a collection button under /list sets it as the active
-    collection — equivalent to /collect <name> but without typing it out.
-    Reserved-name checks (RESERVED_NAMES) don't apply here: the collection
-    already exists in the DB (that's why it's listed), so tapping it is a
-    switch, not a creation of a new collection under a reserved word."""
+    """Chosen from the /list choice menu — sets the collection active,
+    equivalent to /collect <name> but without typing it out. Reserved-name
+    checks (RESERVED_NAMES) don't apply here: the collection already exists
+    in the DB (that's why it was listed), so this is a switch, not a
+    creation of a new collection under a reserved word."""
     query = update.callback_query
     name = query.data[len("listset:"):]
     chat_id = update.effective_chat.id
@@ -733,7 +877,35 @@ async def list_set_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     removing_chats.discard(chat_id)
 
     await query.answer(f"📁 Active: {name}")
-    await context.bot.send_message(chat_id=chat_id, text=f"📁 Active collection set to: {name}")
+    await query.edit_message_text(f"📁 Active collection set to: {name}")
+
+
+async def list_get_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Chosen from the /list choice menu — runs the same flow as /get <name>,
+    starting from page 1."""
+    query = update.callback_query
+    name = query.data[len("listget:"):]
+    chat_id = update.effective_chat.id
+
+    await query.answer()
+    await query.edit_message_text(f"📤 Fetching '{name}'...")
+
+    try:
+        await run_cancellable(chat_id, _get_collection_impl(update, context, name=name, offset=0))
+    except asyncio.CancelledError:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="🛑 Stopped — albums already sent stay sent, nothing else will go out.",
+        )
+    except Exception:
+        logger.exception("Unexpected error while sending collection '%s' from /list", name)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "⚠️ Something went wrong partway through — some albums may have sent. "
+                f"Try /get {name} <page> to resume from where it stopped."
+            ),
+        )
 
 
 async def list_collections(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -791,14 +963,14 @@ async def list_collections(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _build_list_set_buttons(page_rows) -> list:
-    """One button per collection on this /list page; tapping it sets that
-    collection active (same as /collect <name>), so you don't have to type
-    the command out. Skips a collection if its name would push callback_data
-    over Telegram's 64-byte limit (silently — the text listing above always
-    still shows it, /collect <name> still works to set it manually)."""
+    """One button per collection on this /list page; tapping it opens a small
+    choice menu (set active / get videos) instead of assuming which action
+    you want. Skips a collection if its name would push callback_data over
+    Telegram's 64-byte limit (silently — the text listing above always still
+    shows it, /collect <name> or /get <name> still work manually)."""
     buttons = []
     for name, count in page_rows:
-        data = f"listset:{name}"
+        data = f"listchoice:{name}"
         if len(data.encode("utf-8")) > 64:
             continue
         buttons.append([InlineKeyboardButton(f"📁 {name} ({count})", callback_data=data)])
@@ -817,6 +989,35 @@ GET_PAGE_SIZE = 50  # 5 albums of 10
 _pending_pages: dict[str, dict] = {}
 
 
+async def _send_single_video_with_fallback(
+    chat_id: int,
+    file_id: str,
+    file_unique_id: str,
+    caption: str | None,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    """Try sending one video as a proper video first (so it's playable
+    inline); if Telegram rejects it (e.g. 'media_invalid' — the file isn't in
+    a format Telegram can stream as a video), fall back to sending it as a
+    plain document. A document upload doesn't require the streaming
+    validation a video does, so this recovers files that are otherwise
+    unstreamable without needing to re-encode anything. Returns the sent
+    Message on success, or None if both attempts failed (i.e. the file_id
+    itself is dead — expired, revoked, or the underlying file is gone)."""
+    try:
+        return await context.bot.send_video(chat_id=chat_id, video=file_id, caption=caption)
+    except TelegramError as e:
+        logger.warning(
+            "send_video failed for file_unique_id=%s (%s) — trying send_document fallback",
+            file_unique_id, e,
+        )
+    try:
+        return await context.bot.send_document(chat_id=chat_id, document=file_id, caption=caption)
+    except TelegramError:
+        logger.exception("send_document fallback also failed for file_unique_id=%s", file_unique_id)
+        return None
+
+
 async def _send_page(
     chat_id: int,
     name: str,
@@ -828,15 +1029,21 @@ async def _send_page(
     reply_msg,
 ):
     """Send one page worth of albums (up to GET_PAGE_SIZE videos).
-    Returns list of (message_id, file_unique_id) for sent_videos recording.
-    Handles RetryAfter by waiting the exact time Telegram specifies and retrying."""
+    Returns (sent_records, album_statuses):
+      - sent_records: list of (message_id, file_unique_id) for sent_videos recording.
+      - album_statuses: list of (local_album_num, status) where status is
+        "ok" (all 10 sent), "partial" (some sent, at least one didn't), or
+        "fail" (none sent).
+    Handles RetryAfter by waiting the exact time Telegram specifies and
+    retrying. If a whole album fails to send as a group (e.g. one bad file
+    poisons the batch), falls back to sending that album's videos one at a
+    time so the other 9 aren't needlessly skipped."""
     page_rows = rows[offset: offset + GET_PAGE_SIZE]
     total_albums_overall = (len(rows) + ALBUM_SIZE - 1) // ALBUM_SIZE
     album_offset = offset // ALBUM_SIZE
 
     sent_records = []
-    album_statuses = []  # list of (local_album_num, success: bool), one per album in this page
-    last_sent_messages = None
+    album_statuses = []  # list of (local_album_num, status)
 
     for album_idx, i in enumerate(range(0, len(page_rows), ALBUM_SIZE)):
         batch = page_rows[i: i + ALBUM_SIZE]
@@ -852,9 +1059,13 @@ async def _send_page(
             for j, (fid, _) in enumerate(batch)
         ]
 
-        # Retry loop for Telegram flood control (RetryAfter).
+        # Retry loop for Telegram flood control (RetryAfter). Any other
+        # TelegramError (e.g. media_invalid from one bad file in the batch)
+        # falls through to the per-video fallback below instead of giving up
+        # on the whole album.
         retries = 0
         last_sent_messages = None
+        group_failed = False
         while True:
             try:
                 last_sent_messages = await context.bot.send_media_group(
@@ -871,17 +1082,48 @@ async def _send_page(
                     )
                     await asyncio.sleep(float(retry_after) + 1)
                     continue
-                logger.exception("Failed to send album %d for '%s'", global_album_num, name)
-                await reply_msg.reply_text(
-                    f"⚠️ Album {global_album_num} failed to send (possibly an expired file) — skipping."
+                logger.warning(
+                    "Album %d failed to send as a group (%s) — retrying its videos individually",
+                    global_album_num, e,
                 )
+                group_failed = True
                 break
 
-        album_statuses.append((local_album_num, bool(last_sent_messages)))
-
-        if last_sent_messages:
+        if not group_failed and last_sent_messages:
             for msg, (_, file_unique_id) in zip(last_sent_messages, batch):
                 sent_records.append((msg.message_id, file_unique_id))
+            album_statuses.append((local_album_num, "ok"))
+        else:
+            # The group send failed (or was skipped) — send this album's
+            # videos one at a time so a single bad file doesn't take the
+            # other 9 down with it.
+            failed_count = 0
+            sent_count = 0
+            for j, (fid, file_unique_id) in enumerate(batch):
+                single_caption = caption if j == 0 else None
+                msg = await _send_single_video_with_fallback(
+                    chat_id, fid, file_unique_id, single_caption, context
+                )
+                if msg is not None:
+                    sent_records.append((msg.message_id, file_unique_id))
+                    sent_count += 1
+                else:
+                    failed_count += 1
+                await asyncio.sleep(0.3)  # small gap between individual sends
+
+            if failed_count == 0:
+                album_statuses.append((local_album_num, "ok"))
+            elif sent_count == 0:
+                album_statuses.append((local_album_num, "fail"))
+            else:
+                album_statuses.append((local_album_num, "partial"))
+
+            if failed_count:
+                await reply_msg.reply_text(
+                    f"⚠️ Album {global_album_num}: {failed_count} of {len(batch)} video(s) couldn't be sent "
+                    f"at all — likely a dead file_id (expired or the original file is gone), not just an "
+                    f"unsupported format. The other {sent_count} went through individually."
+                )
 
         # Delay between albums keeps us well under Telegram's 20 messages/min
         # flood limit. This is also where /stop cancellation takes effect
@@ -1032,16 +1274,17 @@ async def _get_collection_impl(
             logger.exception("Failed to record sent_videos for '%s'", name)
 
     # Row of numbered buttons showing per-album send status for this page —
-    # one button per album (10 videos each), ✅ if that album's media group
-    # sent successfully, ❌ if it failed (e.g. an expired file_id). Purely
+    # one button per album (10 videos each): ✅ all 10 sent, ⚠️ some sent but
+    # not all (per-video fallback kicked in), ❌ none of them sent. Purely
     # informational: tapping one just shows its status, it doesn't do anything.
+    STATUS_EMOJI = {"ok": "✅", "partial": "⚠️", "fail": "❌"}
     STATUS_BUTTONS_PER_ROW = 8
     status_buttons = [
         InlineKeyboardButton(
-            f"{num}✅" if ok else f"{num}❌",
-            callback_data=f"getalbumstatus:{page_num}:{num}:{'ok' if ok else 'fail'}",
+            f"{num}{STATUS_EMOJI[status]}",
+            callback_data=f"getalbumstatus:{page_num}:{num}:{status}",
         )
-        for num, ok in album_statuses
+        for num, status in album_statuses
     ]
     status_rows = [
         status_buttons[i:i + STATUS_BUTTONS_PER_ROW]
@@ -1115,9 +1358,18 @@ async def get_album_status_callback(update: Update, context: ContextTypes.DEFAUL
     query = update.callback_query
     _, page_num, album_num, status = query.data.split(":")
     if status == "ok":
-        await query.answer(f"Album {album_num} (page {page_num}): sent successfully ✅")
+        await query.answer(f"Album {album_num} (page {page_num}): all 10 sent successfully ✅")
+    elif status == "partial":
+        await query.answer(
+            f"Album {album_num} (page {page_num}): some videos sent, some couldn't ⚠️ — "
+            f"see the message above for which ones failed.",
+            show_alert=True,
+        )
     else:
-        await query.answer(f"Album {album_num} (page {page_num}): failed to send ❌ — file may have expired", show_alert=True)
+        await query.answer(
+            f"Album {album_num} (page {page_num}): none of these sent ❌ — the file_id(s) are likely dead.",
+            show_alert=True,
+        )
 
 
 async def get_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1637,6 +1889,203 @@ async def random_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+
+# ---------------------------------------------------------------------------
+# /neardupes — list near-duplicate videos in a collection with fetch button
+# ---------------------------------------------------------------------------
+
+# Tokens for pending /neardupes fetches, same pattern as /get pagination
+_pending_neardupes: dict[str, dict] = {}
+
+
+async def neardupes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List near-duplicate videos in a collection (flagged during save for
+    similar duration + file size to existing videos). Shows a count and a
+    button to fetch them, so you can review and decide which to /remove."""
+    if not context.args:
+        await update.message.reply_text("Usage: /neardupes <collection>")
+        return
+
+    name = normalize_name(" ".join(context.args))
+
+    try:
+        def _query(conn):
+            with conn.cursor() as cur:
+                # Find all videos involved in near-dup pairs: both the flagged videos
+                # (V1 with a match partner) AND their match partners (V2s). This way
+                # the user can see the full comparison pairs when fetching.
+                # A video V1 has a potential near-dup match V2 if:
+                #   - both have file_size (not null)
+                #   - if both have duration: ABS(V1.duration - V2.duration) <= 2 seconds
+                #     AND file_size within 2%
+                #   - if only one has duration: file_size within 0.5%
+                cur.execute(
+                    """
+                    SELECT DISTINCT v.file_id, v.file_unique_id, v.added_at
+                    FROM videos v
+                    WHERE v.collection = %s
+                      AND v.file_size IS NOT NULL
+                      AND (
+                        EXISTS (
+                          SELECT 1 FROM videos v2
+                          WHERE v2.collection = v.collection
+                            AND v2.file_unique_id != v.file_unique_id
+                            AND v2.file_size IS NOT NULL
+                            AND (
+                              (v.duration IS NOT NULL AND v2.duration IS NOT NULL
+                               AND ABS(v.duration - v2.duration) <= 2
+                               AND v2.file_size BETWEEN v.file_size * 0.98 AND v.file_size * 1.02)
+                              OR
+                              (v.duration IS NULL OR v2.duration IS NULL
+                               AND v2.file_size BETWEEN v.file_size * 0.995 AND v.file_size * 1.005)
+                            )
+                        )
+                      )
+                    ORDER BY v.added_at DESC
+                    """,
+                    (name,),
+                )
+                return cur.fetchall()
+        rows = await db_run(_query)
+    except Exception:
+        await reply_db_error(update, f"fetch near-dupes in '{name}'")
+        return
+
+    if not rows:
+        await update.message.reply_text(
+            f"No potential near-duplicates found in '{name}' — all clear! ✅"
+        )
+        return
+
+    token = f"{update.effective_chat.id}:{name}"
+    _pending_neardupes[token] = {"name": name, "rows": rows}
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"📤 Fetch {len(rows)} video(s)", callback_data=f"neardupes:{token}"),
+    ]])
+    await update.message.reply_text(
+        f"🔎 Found {len(rows)} video(s) involved in near-duplicate pairs in '{name}'.\n\n"
+        f"These are videos with similar duration/file size that might be repeats. "
+        f"Tap the button to fetch them all — you'll see the potential duplicate pairs together "
+        f"so you can compare and decide which to /remove.",
+        reply_markup=keyboard,
+    )
+
+
+# Token storage for near-dup delete operations (maps token to {collection, file_unique_id})
+_neardup_deletes: dict[str, dict] = {}
+
+
+async def _send_neardupes_individually(
+    chat_id: int,
+    name: str,
+    rows: list,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    """Send near-dup videos one at a time with an individual delete button
+    for each, instead of in albums. This lets users delete specific videos
+    without needing to use /remove."""
+    sent = 0
+    failed = 0
+
+    for fid, file_unique_id, _ in rows:  # _ ignores added_at since we just needed it for ordering
+        try:
+            # Generate a token for this specific delete operation
+            token = f"{chat_id}:{name}:{file_unique_id}"
+            _neardup_deletes[token] = {"collection": name, "file_unique_id": file_unique_id}
+
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🗑️ Delete this", callback_data=f"neardup_delete:{token}"),
+            ]])
+
+            await context.bot.send_video(
+                chat_id=chat_id,
+                video=fid,
+                caption=f"Near-dup in '{name}' — tap the button to delete it, or reply /remove to keep it.",
+                reply_markup=keyboard,
+            )
+            sent += 1
+            await asyncio.sleep(0.5)  # small gap between sends
+        except TelegramError:
+            logger.exception("Failed to send near-dup video file_unique_id=%s", file_unique_id)
+            failed += 1
+
+    summary = f"📤 Sent {sent} near-dup video(s)"
+    if failed:
+        summary += f" ({failed} failed to send)"
+    summary += ". Tap the delete button to remove any, or use /remove to keep them."
+    await context.bot.send_message(chat_id=chat_id, text=summary)
+
+
+async def neardup_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Delete a near-dup video directly via the inline button."""
+    query = update.callback_query
+    token = query.data[len("neardup_delete:"):]
+    delete_info = _neardup_deletes.pop(token, None)
+
+    if delete_info is None:
+        await query.answer("⏱️ This button has expired.")
+        return
+
+    collection = delete_info["collection"]
+    file_unique_id = delete_info["file_unique_id"]
+
+    try:
+        def _delete(conn):
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM videos WHERE collection = %s AND file_unique_id = %s",
+                    (collection, file_unique_id),
+                )
+                return cur.rowcount
+        deleted = await db_run(_delete)
+    except Exception:
+        logger.exception("DB error deleting near-dup video from '%s'", collection)
+        await query.answer("⚠️ Couldn't delete — database error.", show_alert=True)
+        return
+
+    if deleted:
+        await query.answer(f"🗑️ Deleted from '{collection}'")
+        await query.edit_message_text("🗑️ Deleted.")
+    else:
+        await query.answer("⚠️ Already deleted or not found.", show_alert=True)
+
+
+async def neardupes_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback for the 'Fetch near-dupes' button — sends them individually
+    with a delete button under each one."""
+    query = update.callback_query
+    token = query.data[len("neardupes:"):]
+    state = _pending_neardupes.pop(token, None)
+
+    if state is None:
+        await query.answer("⏱️ This button has expired.")
+        return
+
+    await query.answer()
+    await query.edit_message_text(f"📤 Fetching {len(state['rows'])} near-dup(s) from '{state['name']}'...")
+
+    chat_id = update.effective_chat.id
+    name = state["name"]
+    rows = state["rows"]
+
+    try:
+        await run_cancellable(
+            chat_id,
+            _send_neardupes_individually(chat_id, name, rows, context),
+        )
+    except asyncio.CancelledError:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="🛑 Stopped — videos already sent stay sent.",
+        )
+    except Exception:
+        logger.exception("Unexpected error while sending near-dupes for '%s'", name)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="⚠️ Something went wrong sending the near-dupes. Try /neardupes again.",
+        )
+
+
 # ---------------------------------------------------------------------------
 # /stats — overview of the whole database
 # ---------------------------------------------------------------------------
@@ -1710,12 +2159,38 @@ async def post_init(application: Application):
         BotCommand("delete", "Delete a collection"),
         BotCommand("status", "Show count in active collection"),
         BotCommand("random", "Send a random video from a collection"),
+        BotCommand("neardupes", "List near-duplicate videos in a collection"),
         BotCommand("stats", "Show overall database stats"),
         BotCommand("help", "Show help and command list"),
     ])
 
 
-def main():
+async def telegram_webhook(request):
+    """Receives Telegram's POST to /webhook. We're no longer using PTB's
+    built-in webhook server (which validated the secret token for us), so we
+    check the X-Telegram-Bot-Api-Secret-Token header ourselves before
+    accepting anything, then hand the parsed Update off to the Application's
+    internal update queue exactly like the built-in server did."""
+    application = request.app.state.application
+
+    secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+    if secret_header != WEBHOOK_SECRET:
+        logger.warning("Rejected webhook POST with missing/invalid secret token header")
+        return Response(status_code=401)
+
+    data = await request.json()
+    update = Update.de_json(data=data, bot=application.bot)
+    await application.update_queue.put(update)
+    return Response(status_code=200)
+
+
+async def health_check(request):
+    """Plain 200 OK for uptime monitors (e.g. UptimeRobot) — no auth, no
+    Telegram-specific logic, just confirms the process is up and serving."""
+    return PlainTextResponse("OK")
+
+
+async def run():
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     # Access control runs first, in group -1, ahead of every other handler
@@ -1741,12 +2216,17 @@ def main():
     application.add_handler(CommandHandler("delete", delete_collection))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("random", random_video))
+    application.add_handler(CommandHandler("neardupes", neardupes))
     application.add_handler(CommandHandler("stats", stats))
 
     application.add_handler(CallbackQueryHandler(delete_callback, pattern=r"^del(confirm|cancel):"))
     application.add_handler(CallbackQueryHandler(get_page_callback, pattern=r"^get(page|stop):"))
     application.add_handler(CallbackQueryHandler(get_album_status_callback, pattern=r"^getalbumstatus:"))
+    application.add_handler(CallbackQueryHandler(list_choice_callback, pattern=r"^listchoice:"))
     application.add_handler(CallbackQueryHandler(list_set_callback, pattern=r"^listset:"))
+    application.add_handler(CallbackQueryHandler(list_get_callback, pattern=r"^listget:"))
+    application.add_handler(CallbackQueryHandler(neardupes_callback, pattern=r"^neardupes:"))
+    application.add_handler(CallbackQueryHandler(neardup_delete_callback, pattern=r"^neardup_delete:"))
 
     application.add_handler(MessageHandler(filters.VIDEO, handle_video))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
@@ -1755,13 +2235,33 @@ def main():
         handle_non_video,
     ))
 
-    application.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        secret_token=WEBHOOK_SECRET,
-        webhook_url=f"{RENDER_EXTERNAL_URL}/webhook",
-        url_path="webhook",
+    web_app = Starlette(routes=[
+        Route("/webhook", telegram_webhook, methods=["POST"]),
+        Route("/health", health_check, methods=["GET", "HEAD"]),
+    ])
+    web_app.state.application = application
+
+    server = uvicorn.Server(
+        uvicorn.Config(app=web_app, host="0.0.0.0", port=PORT, log_level="info")
     )
+
+    # async with application: calls application.initialize() on entry (which
+    # runs post_init -> init_db() and set_my_commands(), same as before) and
+    # application.shutdown() on exit.
+    async with application:
+        await application.bot.set_webhook(
+            url=f"{RENDER_EXTERNAL_URL}/webhook",
+            secret_token=WEBHOOK_SECRET,
+        )
+        await application.start()
+        try:
+            await server.serve()
+        finally:
+            await application.stop()
+
+
+def main():
+    asyncio.run(run())
 
 
 if __name__ == "__main__":
