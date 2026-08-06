@@ -1954,19 +1954,18 @@ async def neardupes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await update.message.reply_text(
-        f"🔎 Found {len(rows)} near-duplicate video(s) in '{name}' "
-        f"(similar duration/size to other videos in the collection):\n\n"
-        f"Tap the button below to fetch them all at once, then use /remove "
-        f"to delete any that are actually repeats."
-    )
-
     token = f"{update.effective_chat.id}:{name}"
     _pending_neardupes[token] = {"name": name, "rows": rows}
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton(f"📤 Fetch {len(rows)} near-dup(s)", callback_data=f"neardupes:{token}"),
     ]])
-    await update.message.reply_text("", reply_markup=keyboard)
+    await update.message.reply_text(
+        f"🔎 Found {len(rows)} near-duplicate video(s) in '{name}' "
+        f"(similar duration/size to other videos in the collection):\n\n"
+        f"Tap the button below to fetch them all at once, then use /remove "
+        f"to delete any that are actually repeats.",
+        reply_markup=keyboard,
+    )
 
 
 async def neardupes_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
