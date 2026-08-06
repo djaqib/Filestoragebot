@@ -1921,7 +1921,7 @@ async def neardupes(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 #   - if only one has duration: file_size within 0.5%
                 cur.execute(
                     """
-                    SELECT DISTINCT v.file_id, v.file_unique_id
+                    SELECT DISTINCT v.file_id, v.file_unique_id, v.added_at
                     FROM videos v
                     WHERE v.collection = %s
                       AND v.file_size IS NOT NULL
@@ -1987,7 +1987,7 @@ async def _send_neardupes_individually(
     sent = 0
     failed = 0
 
-    for fid, file_unique_id in rows:
+    for fid, file_unique_id, _ in rows:  # _ ignores added_at since we just needed it for ordering
         try:
             # Generate a token for this specific delete operation
             token = f"{chat_id}:{name}:{file_unique_id}"
