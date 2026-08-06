@@ -476,6 +476,7 @@ HELP_TEXT = (
     "/delete `<name>` \\- Permanently delete a collection and its videos\n"
     "/status \\- Show video count in the active collection\\(s\\)\n"
     "/random `<name>` \\- Send back one random video from a collection\n"
+    "/neardupes `<name>` \\- List near-duplicate videos in a collection, with a button to fetch them\n"
     "/stats \\- Show overall stats across all collections\n"
     "/help \\- Show this help message"
 )
@@ -1888,6 +1889,122 @@ async def random_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+
+# ---------------------------------------------------------------------------
+# /neardupes — list near-duplicate videos in a collection with fetch button
+# ---------------------------------------------------------------------------
+
+# Tokens for pending /neardupes fetches, same pattern as /get pagination
+_pending_neardupes: dict[str, dict] = {}
+
+
+async def neardupes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List near-duplicate videos in a collection (flagged during save for
+    similar duration + file size to existing videos). Shows a count and a
+    button to fetch them, so you can review and decide which to /remove."""
+    if not context.args:
+        await update.message.reply_text("Usage: /neardupes <collection>")
+        return
+
+    name = normalize_name(" ".join(context.args))
+
+    try:
+        def _query(conn):
+            with conn.cursor() as cur:
+                # Find videos that have potential near-dupes in this collection.
+                # A video V1 is flagged if there exists another video V2 in the
+                # same collection where:
+                #   - both have file_size (not null)
+                #   - if both have duration: ABS(V1.duration - V2.duration) <= 2 seconds
+                #     AND file_size within 2%
+                #   - if only one has duration: file_size within 0.5%
+                cur.execute(
+                    """
+                    SELECT DISTINCT v1.file_id, v1.file_unique_id, v1.duration, v1.file_size, v1.added_at
+                    FROM videos v1
+                    WHERE v1.collection = %s
+                      AND v1.file_size IS NOT NULL
+                      AND EXISTS (
+                          SELECT 1 FROM videos v2
+                          WHERE v2.collection = v1.collection
+                            AND v2.file_unique_id != v1.file_unique_id
+                            AND v2.file_size IS NOT NULL
+                            AND (
+                              (v1.duration IS NOT NULL AND v2.duration IS NOT NULL
+                               AND ABS(v1.duration - v2.duration) <= 2
+                               AND v2.file_size BETWEEN v1.file_size * 0.98 AND v1.file_size * 1.02)
+                              OR
+                              (v1.duration IS NULL OR v2.duration IS NULL
+                               AND v2.file_size BETWEEN v1.file_size * 0.995 AND v1.file_size * 1.005)
+                            )
+                      )
+                    ORDER BY v1.added_at DESC
+                    """,
+                    (name,),
+                )
+                return cur.fetchall()
+        rows = await db_run(_query)
+    except Exception:
+        await reply_db_error(update, f"fetch near-dupes in '{name}'")
+        return
+
+    if not rows:
+        await update.message.reply_text(
+            f"No potential near-duplicates found in '{name}' — all clear! ✅"
+        )
+        return
+
+    await update.message.reply_text(
+        f"🔎 Found {len(rows)} near-duplicate video(s) in '{name}' "
+        f"(similar duration/size to other videos in the collection):\n\n"
+        f"Tap the button below to fetch them all at once, then use /remove "
+        f"to delete any that are actually repeats."
+    )
+
+    token = f"{update.effective_chat.id}:{name}"
+    _pending_neardupes[token] = {"name": name, "rows": rows}
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"📤 Fetch {len(rows)} near-dup(s)", callback_data=f"neardupes:{token}"),
+    ]])
+    await update.message.reply_text("", reply_markup=keyboard)
+
+
+async def neardupes_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback for the 'Fetch near-dupes' button — sends them back just like
+    /get does, but only the flagged videos."""
+    query = update.callback_query
+    token = query.data[len("neardupes:"):]
+    state = _pending_neardupes.pop(token, None)
+
+    if state is None:
+        await query.answer("⏱️ This button has expired.")
+        return
+
+    await query.answer()
+    await query.edit_message_text(f"📤 Fetching {len(state['rows'])} near-dup(s) from '{state['name']}'...")
+
+    chat_id = update.effective_chat.id
+    name = state["name"]
+    rows = state["rows"]
+
+    try:
+        await run_cancellable(
+            chat_id,
+            _get_collection_impl(update, context, name=name, offset=0, rows=rows),
+        )
+    except asyncio.CancelledError:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="🛑 Stopped — albums already sent stay sent, nothing else will go out.",
+        )
+    except Exception:
+        logger.exception("Unexpected error while sending near-dupes for '%s'", name)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="⚠️ Something went wrong loading the near-dupes. Try /neardupes again.",
+        )
+
+
 # ---------------------------------------------------------------------------
 # /stats — overview of the whole database
 # ---------------------------------------------------------------------------
@@ -1961,6 +2078,7 @@ async def post_init(application: Application):
         BotCommand("delete", "Delete a collection"),
         BotCommand("status", "Show count in active collection"),
         BotCommand("random", "Send a random video from a collection"),
+        BotCommand("neardupes", "List near-duplicate videos in a collection"),
         BotCommand("stats", "Show overall database stats"),
         BotCommand("help", "Show help and command list"),
     ])
@@ -2017,6 +2135,7 @@ async def run():
     application.add_handler(CommandHandler("delete", delete_collection))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("random", random_video))
+    application.add_handler(CommandHandler("neardupes", neardupes))
     application.add_handler(CommandHandler("stats", stats))
 
     application.add_handler(CallbackQueryHandler(delete_callback, pattern=r"^del(confirm|cancel):"))
@@ -2025,6 +2144,7 @@ async def run():
     application.add_handler(CallbackQueryHandler(list_choice_callback, pattern=r"^listchoice:"))
     application.add_handler(CallbackQueryHandler(list_set_callback, pattern=r"^listset:"))
     application.add_handler(CallbackQueryHandler(list_get_callback, pattern=r"^listget:"))
+    application.add_handler(CallbackQueryHandler(neardupes_callback, pattern=r"^neardupes:"))
 
     application.add_handler(MessageHandler(filters.VIDEO, handle_video))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
