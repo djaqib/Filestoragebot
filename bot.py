@@ -2505,7 +2505,7 @@ async def health_check(request):
     return PlainTextResponse("OK")
 
 async def run():
-    application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(TypeHandler(Update, access_control), group=-1)
 
@@ -2564,24 +2564,39 @@ async def run():
     # Message handlers
     application.add_handler(MessageHandler(filters.VIDEO, handle_video))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    application.add_handler(MessageHandler(filters.PHOTO | filters.AUDIO | filters.VOICE, handle_non_video))
+    application.add_handler(MessageHandler(
+        filters.PHOTO | filters.AUDIO | filters.VOICE,
+        handle_non_video
+    ))
 
     web_app = Starlette(routes=[
         Route("/webhook", telegram_webhook, methods=["POST"]),
         Route("/health", health_check, methods=["GET", "HEAD"]),
     ])
+
     web_app.state.application = application
 
     server = uvicorn.Server(
-        uvicorn.Config(app=web_app, host="0.0.0.0", port=PORT, log_level="info")
+        uvicorn.Config(
+            app=web_app,
+            host="0.0.0.0",
+            port=PORT,
+            log_level="info"
+        )
     )
 
     async with application:
+
+        # IMPORTANT: manually run post_init
+        await post_init(application)
+
         await application.bot.set_webhook(
             url=f"{RENDER_EXTERNAL_URL}/webhook",
             secret_token=WEBHOOK_SECRET,
         )
+
         await application.start()
+
         try:
             await server.serve()
         finally:
