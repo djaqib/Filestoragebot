@@ -1275,14 +1275,17 @@ async def _get_collection_impl(
     try:
         def _query(conn):
             with conn.cursor() as cur:
+                # Log the query for debugging
+                logger.info(f"Executing query for collection '{name}' with order: {order_clause}")
                 cur.execute(
                     f"SELECT file_id, file_unique_id, duration, file_size FROM videos WHERE collection = %s {order_clause}",
                     (name,),
                 )
                 return cur.fetchall()
         rows = await db_run(_query)
-    except Exception:
-        await reply_db_error(update, f"fetch '{name}'")
+    except Exception as e:
+        # Pass the actual error to reply_db_error
+        await reply_db_error(update, f"fetch '{name}'", e)
         return
 
     if not rows:
@@ -1308,7 +1311,7 @@ async def _get_collection_impl(
         return
 
     await _do_send_page(update, context, name, rows, page_num, total_pages, offset, order_by)
-
+    
 async def get_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
