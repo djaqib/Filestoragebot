@@ -60,7 +60,7 @@ DEFAULT_COLLECTION = "default"
 FAVORITES_COLLECTION = "favorites"
 RESERVED_NAMES = {"default", "all"}
 BATCH_DEBOUNCE_SECONDS = 2.5
-LIST_PAGE_SIZE = 15
+LIST_PAGE_SIZE = 30
 ALBUM_SIZE = 10
 ALBUM_DELAY_SECONDS = 3
 GET_PAGE_SIZE = 50
@@ -406,8 +406,8 @@ HELP_TEXT = (
     "/minlength <seconds> or off - Skip short videos\n"
     "/current - Show active collection(s)\n"
     "/list - List all collections\n"
-    "/get <name> [page] - Send back videos in albums (sorted by added date)\n"
-    "/getbysize <name> [asc|desc] - Send videos sorted by file size\n"
+    "/get <name> (page) - Send back videos in albums (sorted by added date)\n"
+    "/getbysize <name> (asc|desc) - Send videos sorted by file size\n"
     "/remove - Reply to a bot-sent video to delete it\n"
     "/rename <old> -> <new> - Rename collection\n"
     "/merge <a> -> <b> - Move videos, remove source\n"
@@ -417,12 +417,12 @@ HELP_TEXT = (
     "/importjson - Reply to a JSON file to import (admin)\n"
     "/delete <name> - Delete collection permanently\n"
     "/status - Count in active collection(s)\n"
-    "/random <name> [count] - Send random video(s)\n"
+    "/random <name> (count) - Send random video(s)\n"
     "/neardupes <name> - Find near-duplicates\n"
     "/dups <name> - Find exact duplicates across collections\n"
-    "/recent <name> [n] - Show last N added videos\n"
+    "/recent <name> (n) - Show last N added videos\n"
     "/cleanup <name> - Remove dead file_ids\n"
-    "/find collection [duration:>60] [size:<10MB] - Search videos\n"
+    "/find collection (duration:>60) (size:<10MB) - Search videos\n"
     "/stats - Overall database stats\n"
     "/backup - Full DB backup (admin)\n"
     "/menu - Open the main menu"
@@ -437,11 +437,9 @@ async def show_menu(chat_id: int, context: ContextTypes.DEFAULT_TYPE, text: Opti
     if text is None:
         text = f"🏠 *Main Menu*\nActive: {active}\n\nChoose an action:"
     keyboard = [
-        [InlineKeyboardButton("👋 Start / Welcome", callback_data="menu_start")],
         [InlineKeyboardButton("📁 Set Active", callback_data="menu_active")],
         [InlineKeyboardButton("📤 View Collection", callback_data="menu_view")],
         [InlineKeyboardButton("🎲 Random Video", callback_data="menu_random")],
-        [InlineKeyboardButton("📚 List Collections", callback_data="menu_list")],
         [InlineKeyboardButton("⏸️ Pause/Resume", callback_data="menu_pause")],
         [InlineKeyboardButton("❓ Help", callback_data="menu_help")],
         [InlineKeyboardButton("🛑 Stop & Pause", callback_data="menu_stop")],
@@ -462,20 +460,12 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     chat_id = update.effective_chat.id
 
-    if data == "menu_start":
-        await query.edit_message_text(
-            "👋 Send me videos and I'll collect them.\n\n"
-            "Try /menu for an easy button interface, or /help for all commands."
-        )
-        await show_menu(chat_id, context, text="Back to menu:")
-    elif data == "menu_active":
+    if data == "menu_active":
         await _show_collection_list_for_action(chat_id, context, action="set")
     elif data == "menu_view":
         await _show_collection_list_for_action(chat_id, context, action="view")
     elif data == "menu_random":
         await _show_collection_list_for_action(chat_id, context, action="random")
-    elif data == "menu_list":
-        await _show_list_page(chat_id, context, search="", page=1, edit_msg=query.message)
     elif data == "menu_pause":
         if chat_id in paused_chats:
             paused_chats.discard(chat_id)
@@ -494,6 +484,8 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         paused_chats.add(chat_id)
         await query.edit_message_text("🛑 Stopped and paused.")
         await show_menu(chat_id, context, text="Back to menu:")
+    elif data == "menu_back":
+        await show_menu(chat_id, context, text="Back to main menu:")
 
 async def _show_collection_list_for_action(chat_id: int, context: ContextTypes.DEFAULT_TYPE, action: str):
     try:
@@ -704,10 +696,11 @@ async def _show_list_page(chat_id: int, context: ContextTypes.DEFAULT_TYPE, sear
     start_idx = (page - 1) * LIST_PAGE_SIZE
     page_rows = rows[start_idx:start_idx + LIST_PAGE_SIZE]
 
-    lines = [f"• {name} — {count} video(s)" for name, count in page_rows]
     header = "📚 Collections" + (f" matching '{search}'" if search else "")
+    header += f" ({len(rows)} total"
     if total_pages > 1:
-        header += f" (page {page}/{total_pages})"
+        header += f", page {page}/{total_pages}"
+    header += ")"
 
     token = _list_token(chat_id, search)
     _list_pages[token] = (rows, page, search)
@@ -729,15 +722,16 @@ async def _show_list_page(chat_id: int, context: ContextTypes.DEFAULT_TYPE, sear
             page_buttons.append(InlineKeyboardButton(label, callback_data=f"listpage:{token}:{p}"))
         buttons.append(page_buttons)
 
-    for name, count in page_rows:
+    for i in range(0, len(page_rows), 2):
         row = [
-            InlineKeyboardButton(f"📁 {name} ({count})", callback_data=f"listchoice:{name}"),
+            InlineKeyboardButton(f"📁 {name} ({count})", callback_data=f"listchoice:{name}")
+            for name, count in page_rows[i:i + 2]
         ]
         buttons.append(row)
 
     buttons.append([InlineKeyboardButton("🔙 Back to menu", callback_data="menu_back")])
 
-    text = f"{header}:\n" + "\n".join(lines)
+    text = f"{header}:"
     if edit_msg:
         await edit_msg.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
     else:
@@ -759,9 +753,8 @@ async def list_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     start_idx = (page - 1) * LIST_PAGE_SIZE
     page_rows = rows[start_idx:start_idx + LIST_PAGE_SIZE]
-    lines = [f"• {name} — {count} video(s)" for name, count in page_rows]
     header = "📚 Collections" + (f" matching '{search}'" if search else "")
-    header += f" (page {page}/{total_pages})"
+    header += f" ({len(rows)} total, page {page}/{total_pages})"
 
     buttons = []
     if total_pages > 1:
@@ -780,15 +773,16 @@ async def list_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             page_buttons.append(InlineKeyboardButton(label, callback_data=f"listpage:{token}:{p}"))
         buttons.append(page_buttons)
 
-    for name, count in page_rows:
+    for i in range(0, len(page_rows), 2):
         row = [
-            InlineKeyboardButton(f"📁 {name} ({count})", callback_data=f"listchoice:{name}"),
+            InlineKeyboardButton(f"📁 {name} ({count})", callback_data=f"listchoice:{name}")
+            for name, count in page_rows[i:i + 2]
         ]
         buttons.append(row)
     buttons.append([InlineKeyboardButton("🔙 Back to menu", callback_data="menu_back")])
 
     await query.edit_message_text(
-        f"{header}:\n" + "\n".join(lines),
+        f"{header}:",
         reply_markup=InlineKeyboardMarkup(buttons),
         parse_mode="Markdown",
     )
@@ -2539,7 +2533,6 @@ async def run():
     application.add_handler(CallbackQueryHandler(menu_set_callback, pattern=r"^menuset:"))
     application.add_handler(CallbackQueryHandler(menu_view_callback, pattern=r"^menuview:"))
     application.add_handler(CallbackQueryHandler(menu_random_callback, pattern=r"^menurandom:"))
-    application.add_handler(CallbackQueryHandler(menu_back_callback, pattern=r"^menu_back"))
     application.add_handler(CallbackQueryHandler(random_next_callback, pattern=r"^random_next:"))
 
     # Message handlers
