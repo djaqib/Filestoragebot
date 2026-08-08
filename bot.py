@@ -56,7 +56,7 @@ ALLOWED_USER_IDS = {int(uid.strip()) for uid in _raw_allowed.split(",") if uid.s
 if not ALLOWED_USER_IDS:
     raise RuntimeError("ALLOWED_USER_IDS is set but empty — refusing to start.")
 
-DEFAULT_COLLECTION = "default"
+DEFAULT_COLLECTION = "mix"
 FAVORITES_COLLECTION = "favorites"
 RESERVED_NAMES = {"default", "all"}
 BATCH_DEBOUNCE_SECONDS = 2.5
@@ -2493,6 +2493,7 @@ async def reply_db_error(update: Update, action: str):
 async def post_init(application: Application):
     await asyncio.to_thread(init_db)
     await application.bot.set_my_commands([
+        BotCommand("start", "start"),
         BotCommand("menu", "Open main menu"),
         BotCommand("collect", "Set active collection(s)"),
         BotCommand("get", "View a collection"),
