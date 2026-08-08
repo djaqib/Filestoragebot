@@ -1489,12 +1489,22 @@ async def get_by_size(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: /getbysize <collection> [asc|desc] (desc = largest first, asc = smallest first)")
         return
+
     args = list(context.args)
-    name = normalize_name(args[0])
     order = "DESC"
-    if len(args) > 1:
-        if args[1].lower() == "asc":
-            order = "ASC"
+
+    # Check if the last argument is 'asc' or 'desc'
+    if args and args[-1].lower() in ("asc", "desc"):
+        order = args[-1].upper()
+        args = args[:-1]  # Remove it
+
+    if not args:
+        await update.message.reply_text("Please specify a collection name.")
+        return
+
+    # Join the remaining arguments to support spaces in collection names
+    name = normalize_name(" ".join(args))
+
     order_by = f"file_size {order}"
     try:
         await run_cancellable(chat_id, _get_collection_impl(update, context, name=name, offset=0, order_by=order_by))
