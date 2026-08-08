@@ -2430,10 +2430,12 @@ def _parse_filter(s: str) -> Tuple[str, int]:
 # Error handler for DB errors
 # ----------------------------------------------------------------------
 
-async def reply_db_error(update: Update, action: str):
+async def reply_db_error(update: Update, action: str, error: Optional[Exception] = None):
     logger.exception("DB error during: %s", action)
+    if error:
+        logger.error(f"Actual error: {error}")
     await update.effective_message.reply_text(
-        f"⚠️ Couldn't {action} right now — the database didn't respond. Please try again in a moment."
+        f"⚠️ Couldn't {action} right now. Error: {str(error) if error else 'Database did not respond'}"
     )
 
 # ----------------------------------------------------------------------
