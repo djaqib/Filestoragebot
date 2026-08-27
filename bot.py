@@ -45,7 +45,7 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "2026-08-27-3"
+BOT_VERSION = "2026-08-27-5"
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
@@ -70,7 +70,7 @@ ALBUM_DELAY_SECONDS = 1.5
 GET_PAGE_SIZE = 50
 NEARDUPES_PAIRS_PER_PAGE = 10
 NEARDUP_ALBUM_DELAY = 1.5
-FIND_PAGE_SIZE = 15  # Results per page for /find (reduced for cleaner display)
+FIND_PAGE_SIZE = 15
 
 NEAR_DUP_DURATION_TOLERANCE_SECONDS = 2
 NEAR_DUP_SIZE_TOLERANCE_FRACTION = 0.02
@@ -121,16 +121,25 @@ db_pool = psycopg2.pool.SimpleConnectionPool(
 )
 
 def _db_call(fn):
-    conn = db_pool.getconn()
+    conn = None
     try:
+        conn = db_pool.getconn()
         result = fn(conn)
         conn.commit()
         return result
-    except Exception:
-        conn.rollback()
-        raise
+    except Exception as e:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        raise e
     finally:
-        db_pool.putconn(conn)
+        if conn:
+            try:
+                db_pool.putconn(conn)
+            except Exception:
+                pass
 
 async def db_run(fn):
     return await asyncio.to_thread(_db_call, fn)
@@ -157,7 +166,7 @@ def init_db():
                 )
             """)
             
-            # Add file_name column if it doesn't exist (for existing databases)
+            # Add file_name column if it doesn't exist
             cur.execute("""
                 DO $$
                 BEGIN
@@ -496,6 +505,9 @@ HELP_TEXT = (
     "/search <collection> <text> - Search videos by filename\n"
     "/find <collection> [duration:>60] [size:<100MB] - Filter videos\n"
     "  Use only duration:>15 to ignore file size\n\n"
+    "*Maintenance:*\n"
+    "/cleanup <collection> - Remove dead files\n"
+    "/retryfailed <collection> - Retry sending failed videos\n\n"
     "More commands available in /settings → subcategories"
 )
 
@@ -1029,15 +1041,13 @@ async def search_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"No videos found in '{collection}' matching '{search_text}'.")
         return
     
-    # Send results with pagination
     await _send_find_results(update, context, rows, collection, search_text, page=1)
 
 # ----------------------------------------------------------------------
-# Enhanced /find command with pagination and clickable results
+# Enhanced /find command with pagination
 # ----------------------------------------------------------------------
 
 async def find_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Search videos with filters - now with pagination and clickable results"""
     chat_id = update.effective_chat.id
     if not rate_limit(chat_id, "find"):
         await update.message.reply_text("⏳ Please wait.")
@@ -1059,7 +1069,6 @@ async def find_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     collection = normalize_name(args[0])
     filters_raw = args[1:]
     
-    # Parse filters
     dur_filter = None
     size_filter = None
     for f in filters_raw:
@@ -1081,7 +1090,6 @@ async def find_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if size_filter:
         try:
-            # Remove MB/mb suffix
             size_val = size_filter.replace("MB", "").replace("mb", "").strip()
             op, val = _parse_filter(size_val)
             conditions.append(f"file_size {op} %s")
@@ -1091,7 +1099,6 @@ async def find_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     where = " AND ".join(conditions) if conditions else "1=1"
     
-    # Add LIMIT and OFFSET - we'll fetch all matching videos for pagination
     try:
         def _query(conn):
             with conn.cursor() as cur:
@@ -1113,7 +1120,6 @@ async def find_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"No videos found in '{collection}' matching your filters.")
         return
 
-    # Store results for pagination
     token = f"{chat_id}:find:{collection}"
     _find_results[token] = {
         'rows': rows,
@@ -1122,11 +1128,9 @@ async def find_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'total': len(rows)
     }
     
-    # Send first page
     await _send_find_page(update, context, token, rows, page=1)
 
 async def _send_find_page(update: Update, context: ContextTypes.DEFAULT_TYPE, token: str, rows: List, page: int):
-    """Send a single page of find results"""
     chat_id = update.effective_chat.id
     total = len(rows)
     total_pages = (total + FIND_PAGE_SIZE - 1) // FIND_PAGE_SIZE
@@ -1138,18 +1142,15 @@ async def _send_find_page(update: Update, context: ContextTypes.DEFAULT_TYPE, to
     end_idx = min(start_idx + FIND_PAGE_SIZE, total)
     page_rows = rows[start_idx:end_idx]
     
-    # Get collection name from stored data
     result_data = _find_results.get(token, {})
     collection = result_data.get('collection', 'unknown')
     filters = result_data.get('filters', [])
     
-    # Build the message
     header = f"🔍 Found {total} video(s) in '{collection}'"
     if filters:
         header += f"\n📋 Filters: {' '.join(filters)}"
     header += f"\n📄 Page {page}/{total_pages}\n"
     
-    # Build the list with clickable buttons
     lines = []
     buttons = []
     
@@ -1160,18 +1161,13 @@ async def _send_find_page(update: Update, context: ContextTypes.DEFAULT_TYPE, to
         size_str = f"{size/1024/1024:.1f}MB" if size else "?MB"
         date_str = added.strftime('%Y-%m-%d %H:%M') if added else "?"
         
-        # Add to list (shorter format)
         lines.append(f"{idx}. {dur_str} / {size_str} — {date_str}")
         
-        # Create a button for each video (limited to avoid too many buttons)
-        # Each button will send the video when clicked
         button_label = f"▶️ {idx}"
         buttons.append([InlineKeyboardButton(button_label, callback_data=f"findvideo:{token}:{idx-1}")])
     
-    # Send the text
     message_text = header + "\n".join(lines)
     
-    # Navigation buttons
     nav_buttons = []
     if page > 1:
         nav_buttons.append(InlineKeyboardButton("◀️ Previous", callback_data=f"findpage:{token}:{page-1}"))
@@ -1180,7 +1176,6 @@ async def _send_find_page(update: Update, context: ContextTypes.DEFAULT_TYPE, to
     if nav_buttons:
         buttons.append(nav_buttons)
     
-    # Add "View All" option (sends all videos in an album)
     if total > FIND_PAGE_SIZE:
         buttons.append([InlineKeyboardButton(f"📤 Send All {total} Videos", callback_data=f"findall:{token}")])
     
@@ -1192,14 +1187,12 @@ async def _send_find_page(update: Update, context: ContextTypes.DEFAULT_TYPE, to
             reply_markup=InlineKeyboardMarkup(buttons)
         )
     else:
-        # Called from callback
         await update.callback_query.edit_message_text(
             message_text,
             reply_markup=InlineKeyboardMarkup(buttons)
         )
 
 async def _send_find_results(update: Update, context: ContextTypes.DEFAULT_TYPE, rows: List, collection: str, search_text: str, page: int):
-    """Send search results with pagination"""
     chat_id = update.effective_chat.id
     token = f"{chat_id}:search:{collection}"
     _find_results[token] = {
@@ -1211,7 +1204,7 @@ async def _send_find_results(update: Update, context: ContextTypes.DEFAULT_TYPE,
     await _send_find_page(update, context, token, rows, page)
 
 # ----------------------------------------------------------------------
-# Find command callbacks
+# Find command callbacks - FIXED
 # ----------------------------------------------------------------------
 
 async def find_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1219,22 +1212,16 @@ async def find_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
     
-    # The data format is: findpage:{token}:{page}
-    # But token already contains collection name, so we need to split differently
     data = query.data
-    # Remove "findpage:" prefix first
-    rest = data[9:]  # len("findpage:") = 9
-    # Now rest is like "find:mix:2" or "find:mix:1"
-    # We need to extract token and page
+    rest = data[9:]  # Remove "findpage:"
     parts = rest.split(":")
     if len(parts) < 3:
         await query.edit_message_text("⏱️ Invalid page data.")
         return
     
-    # The token is everything except the last part (which is the page number)
-    token = ":".join(parts[:-1])  # This gives "find:mix"
+    token = ":".join(parts[:-1])
     try:
-        page = int(parts[-1])  # This gives 1, 2, 3, etc.
+        page = int(parts[-1])
     except ValueError:
         await query.edit_message_text("⏱️ Invalid page number.")
         return
@@ -1252,16 +1239,12 @@ async def find_video_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     await query.answer("📤 Sending video...")
     
-    # Data format: findvideo:{token}:{idx}
-    # Remove "findvideo:" prefix
-    rest = query.data[10:]  # len("findvideo:") = 10
-    # Now rest is like "find:mix:8"
+    rest = query.data[10:]  # Remove "findvideo:"
     parts = rest.split(":")
     if len(parts) < 3:
         await query.answer("Invalid selection.")
         return
     
-    # Token is everything except the last part
     token = ":".join(parts[:-1])
     try:
         idx = int(parts[-1])
@@ -1283,7 +1266,6 @@ async def find_video_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     fid, fuid, dur, size, added, fname = row
     chat_id = update.effective_chat.id
     
-    # Build caption
     caption = f"📹 From search results"
     if fname:
         caption += f"\n📄 {fname}"
@@ -1305,16 +1287,15 @@ async def find_video_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 document=fid,
                 caption=caption
             )
-        except TelegramError as e:
-            await context.bot.send_message(chat_id, f"⚠️ Failed to send video.")
+        except TelegramError:
+            await context.bot.send_message(chat_id, "⚠️ Failed to send video.")
 
 async def find_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send all videos from find results as an album"""
     query = update.callback_query
     await query.answer("📤 Sending all videos...")
     
-    # Data format: findall:{token}
-    token = query.data[8:]  # len("findall:") = 8
+    token = query.data[8:]  # Remove "findall:"
     
     result_data = _find_results.get(token)
     if not result_data:
@@ -1330,7 +1311,6 @@ async def find_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await query.edit_message_text(f"📤 Sending {len(rows)} videos... This may take a moment.")
     
-    # Send in albums of 10
     album_size = 10
     sent = 0
     failed = 0
@@ -1349,8 +1329,7 @@ async def find_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             await context.bot.send_media_group(chat_id=chat_id, media=media_group)
             sent += len(batch)
-        except Exception as e:
-            # Fallback: send individually
+        except Exception:
             for row in batch:
                 fid, fuid, dur, size, added, fname = row
                 try:
@@ -1376,8 +1355,7 @@ async def find_close_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
     await query.edit_message_text("🔍 Search closed.")
     
-    # Clean up stored results
-    _, token = query.data.split(":", 1)
+    token = query.data[9:]  # Remove "findclose:"
     _find_results.pop(token, None)
 
 # ----------------------------------------------------------------------
@@ -1497,7 +1475,7 @@ async def _backup_to_channel(file_id: str, collection: str, context: ContextType
             caption=f"[{collection}]"
         )
     except Exception as e:
-        logger.warning("Failed to backup video to channel %s: %s", BACKUP_CHANNEL_ID, e)
+        logger.warning(f"Failed to backup video to channel %s: %s", BACKUP_CHANNEL_ID, e)
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -1658,12 +1636,14 @@ async def _send_single_video_with_fallback(
 ) -> Optional[Message]:
     try:
         return await context.bot.send_video(chat_id=chat_id, video=file_id, caption=caption)
-    except TelegramError:
-        logger.warning("send_video failed for %s, trying document fallback", file_unique_id)
+    except TelegramError as e:
+        logger.warning(f"send_video failed for {file_unique_id}: {e.message if hasattr(e, 'message') else str(e)}")
+        if "file is not available" in str(e) or "file not found" in str(e):
+            logger.info(f"File {file_unique_id} is dead (not available on Telegram servers)")
     try:
         return await context.bot.send_document(chat_id=chat_id, document=file_id, caption=caption)
-    except TelegramError:
-        logger.exception("send_document also failed for %s", file_unique_id)
+    except TelegramError as e:
+        logger.exception(f"send_document also failed for {file_unique_id}: {e.message if hasattr(e, 'message') else str(e)}")
         if collection_for_dead:
             await _mark_dead_file(file_unique_id, collection_for_dead)
         return None
@@ -1744,7 +1724,7 @@ def _build_page_jump_buttons(chat_id: int, name: str, total_pages: int, current_
     return grid_rows
 
 # ----------------------------------------------------------------------
-# /get, /getbysize commands (keeping your existing code)
+# /get, /getbysize commands
 # ----------------------------------------------------------------------
 
 async def _get_collection_impl(
@@ -2007,6 +1987,93 @@ async def get_by_size(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         logger.exception("Error in /getbysize")
         await update.effective_message.reply_text("⚠️ Something went wrong.")
+
+# ----------------------------------------------------------------------
+# Retry Failed Videos - NEW COMMAND
+# ----------------------------------------------------------------------
+
+async def retry_failed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Retry sending videos that failed previously"""
+    chat_id = update.effective_chat.id
+    
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /retryfailed <collection>\n"
+            "Example: /retryfailed mix\n\n"
+            "This will try to resend videos that failed to send."
+        )
+        return
+    
+    collection = normalize_name(" ".join(context.args))
+    
+    try:
+        def _find_failed(conn):
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT v.file_id, v.file_unique_id, v.duration, v.file_size, v.file_name, v.added_at
+                       FROM videos v
+                       JOIN dead_files d ON v.file_unique_id = d.file_unique_id
+                       WHERE v.collection = %s
+                       ORDER BY v.added_at DESC""",
+                    (collection,)
+                )
+                return cur.fetchall()
+        dead_videos = await db_run(_find_failed)
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Couldn't check dead files: {str(e)[:100]}")
+        return
+    
+    if not dead_videos:
+        await update.message.reply_text(f"✅ No failed/dead videos in '{collection}'.")
+        return
+    
+    await update.message.reply_text(
+        f"🔍 Found {len(dead_videos)} dead videos in '{collection}'.\n"
+        f"🔄 Attempting to retry sending them...\n\n"
+        f"Note: If they still fail, use /cleanup {collection} to remove them."
+    )
+    
+    sent = 0
+    failed = 0
+    still_dead = []
+    
+    for idx, (fid, fuid, dur, size, fname, added) in enumerate(dead_videos, 1):
+        caption = f"🔄 Retry {idx}/{len(dead_videos)}"
+        if fname:
+            caption += f"\n📄 {fname}"
+        if dur is not None and size is not None:
+            caption += f"\n⏱ {dur}s • 📦 {size/1024/1024:.1f}MB"
+        if added:
+            caption += f"\n📅 {added.strftime('%Y-%m-%d %H:%M')}"
+        
+        try:
+            await context.bot.send_video(
+                chat_id=chat_id,
+                video=fid,
+                caption=caption
+            )
+            sent += 1
+            def _remove_dead(conn):
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM dead_files WHERE file_unique_id = %s", (fuid,))
+            await db_run(_remove_dead)
+            await asyncio.sleep(0.5)
+        except TelegramError:
+            failed += 1
+            still_dead.append(fname or f"video_{idx}")
+            await asyncio.sleep(0.3)
+    
+    summary = f"📊 Retry Results for '{collection}':\n"
+    summary += f"✅ Successfully sent: {sent}\n"
+    summary += f"❌ Still failed: {failed}\n"
+    
+    if still_dead:
+        summary += f"\nFailed videos: {', '.join(still_dead[:5])}"
+        if len(still_dead) > 5:
+            summary += f" and {len(still_dead)-5} more"
+        summary += f"\n\n💡 Use /cleanup {collection} to remove them."
+    
+    await update.message.reply_text(summary)
 
 # ----------------------------------------------------------------------
 # Other commands
@@ -2547,8 +2614,7 @@ async def merge_collections(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pair = _parse_arrow_pair(context.args)
     if not pair:
         await update.message.reply_text("Usage: /merge <source> -> <dest>")
-        return
-    src, dest = pair
+        return    src, dest = pair
     if src == dest:
         await update.message.reply_text("Source and destination must differ.")
         return
@@ -3230,6 +3296,8 @@ async def post_init(application: Application):
         BotCommand("delete", "Delete collection (admin)"),
         BotCommand("stats", "Database stats"),
         BotCommand("backup", "Full DB backup (admin)"),
+        BotCommand("retryfailed", "Retry failed/dead videos"),  # NEW
+        BotCommand("cleanup", "Remove dead files"),
     ])
 
 async def telegram_webhook(request):
@@ -3285,6 +3353,7 @@ async def run():
     application.add_handler(CommandHandler("backup", backup))
     application.add_handler(CommandHandler("search", search_videos))
     application.add_handler(CommandHandler("setexpiry", set_expiry))
+    application.add_handler(CommandHandler("retryfailed", retry_failed))  # NEW
 
     # Callbacks
     application.add_handler(CallbackQueryHandler(delete_callback, pattern=r"^del(confirm|cancel):"))
@@ -3306,7 +3375,7 @@ async def run():
     application.add_handler(CallbackQueryHandler(menu_random_callback, pattern=r"^menurandom:"))
     application.add_handler(CallbackQueryHandler(random_next_callback, pattern=r"^random_next:"))
     
-    # NEW: Find command callbacks
+    # Find command callbacks
     application.add_handler(CallbackQueryHandler(find_page_callback, pattern=r"^findpage:"))
     application.add_handler(CallbackQueryHandler(find_video_callback, pattern=r"^findvideo:"))
     application.add_handler(CallbackQueryHandler(find_all_callback, pattern=r"^findall:"))
