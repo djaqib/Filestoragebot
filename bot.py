@@ -1219,8 +1219,25 @@ async def find_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
     
-    _, token, page_str = query.data.split(":", 2)
-    page = int(page_str)
+    # The data format is: findpage:{token}:{page}
+    # But token already contains collection name, so we need to split differently
+    data = query.data
+    # Remove "findpage:" prefix first
+    rest = data[9:]  # len("findpage:") = 9
+    # Now rest is like "find:mix:2" or "find:mix:1"
+    # We need to extract token and page
+    parts = rest.split(":")
+    if len(parts) < 3:
+        await query.edit_message_text("⏱️ Invalid page data.")
+        return
+    
+    # The token is everything except the last part (which is the page number)
+    token = ":".join(parts[:-1])  # This gives "find:mix"
+    try:
+        page = int(parts[-1])  # This gives 1, 2, 3, etc.
+    except ValueError:
+        await query.edit_message_text("⏱️ Invalid page number.")
+        return
     
     result_data = _find_results.get(token)
     if not result_data:
@@ -1235,17 +1252,19 @@ async def find_video_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     await query.answer("📤 Sending video...")
     
-    # Parse: findvideo:{token}:{idx}
-    # But the token already contains the collection name
-    data = query.data
-    parts = data.split(":", 2)  # Split into 3 parts: findvideo, token, idx
-    if len(parts) != 3:
+    # Data format: findvideo:{token}:{idx}
+    # Remove "findvideo:" prefix
+    rest = query.data[10:]  # len("findvideo:") = 10
+    # Now rest is like "find:mix:8"
+    parts = rest.split(":")
+    if len(parts) < 3:
         await query.answer("Invalid selection.")
         return
     
-    _, token, idx_str = parts
+    # Token is everything except the last part
+    token = ":".join(parts[:-1])
     try:
-        idx = int(idx_str)
+        idx = int(parts[-1])
     except ValueError:
         await query.answer("Invalid selection.")
         return
@@ -1280,7 +1299,6 @@ async def find_video_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             caption=caption
         )
     except TelegramError:
-        # Try sending as document
         try:
             await context.bot.send_document(
                 chat_id=chat_id,
@@ -1288,14 +1306,15 @@ async def find_video_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 caption=caption
             )
         except TelegramError as e:
-            await context.bot.send_message(chat_id, f"⚠️ Failed to send video: {str(e)[:100]}")
+            await context.bot.send_message(chat_id, f"⚠️ Failed to send video.")
 
 async def find_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send all videos from find results as an album"""
     query = update.callback_query
     await query.answer("📤 Sending all videos...")
     
-    _, token = query.data.split(":", 1)
+    # Data format: findall:{token}
+    token = query.data[8:]  # len("findall:") = 8
     
     result_data = _find_results.get(token)
     if not result_data:
@@ -1319,7 +1338,6 @@ async def find_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for i in range(0, len(rows), album_size):
         batch = rows[i:i + album_size]
         
-        # Try sending as album
         try:
             media_group = []
             for j, row in enumerate(batch):
@@ -1345,7 +1363,7 @@ async def find_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     failed += 1
                 await asyncio.sleep(0.3)
         
-        await asyncio.sleep(1.5)  # Delay between albums
+        await asyncio.sleep(1.5)
     
     await context.bot.send_message(
         chat_id,
