@@ -2614,7 +2614,8 @@ async def merge_collections(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pair = _parse_arrow_pair(context.args)
     if not pair:
         await update.message.reply_text("Usage: /merge <source> -> <dest>")
-        return    src, dest = pair
+        return    
+        src, dest = pair
     if src == dest:
         await update.message.reply_text("Source and destination must differ.")
         return
