@@ -142,6 +142,7 @@ async def db_run(fn):
 def init_db():
     def _init(conn):
         with conn.cursor() as cur:
+            # Main videos table with all columns
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS videos (
                     id SERIAL PRIMARY KEY,
@@ -156,6 +157,20 @@ def init_db():
                 )
             """)
             
+            # Add file_name column if it doesn't exist (for existing databases)
+            cur.execute("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns 
+                        WHERE table_name='videos' AND column_name='file_name'
+                    ) THEN
+                        ALTER TABLE videos ADD COLUMN file_name TEXT;
+                    END IF;
+                END $$;
+            """)
+            
+            # Sent videos tracking
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS sent_videos (
                     chat_id BIGINT NOT NULL,
@@ -166,11 +181,26 @@ def init_db():
                 )
             """)
             
+            # Create indexes with safety checks
             cur.execute("CREATE INDEX IF NOT EXISTS idx_videos_collection_added_at ON videos (collection, added_at)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_videos_collection_filesize ON videos (collection, file_size)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_videos_file_name ON videos (file_name)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_videos_duration ON videos (duration)")  # NEW for faster duration search
             
+            # Only create file_name index if column exists
+            cur.execute("""
+                DO $$
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.columns 
+                        WHERE table_name='videos' AND column_name='file_name'
+                    ) THEN
+                        CREATE INDEX IF NOT EXISTS idx_videos_file_name ON videos (file_name);
+                    END IF;
+                END $$;
+            """)
+            
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_videos_duration ON videos (duration)")
+            
+            # Dead files tracking
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS dead_files (
                     file_unique_id TEXT PRIMARY KEY,
@@ -179,6 +209,7 @@ def init_db():
                 )
             """)
             
+            # Collection settings for expiry
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS collection_settings (
                     collection TEXT PRIMARY KEY,
@@ -187,8 +218,10 @@ def init_db():
                 )
             """)
             
+            # Clean up old dead files (older than 30 days)
             cur.execute("DELETE FROM dead_files WHERE detected_at < NOW() - INTERVAL '30 days'")
             
+            # Remove duplicates
             cur.execute("""
                 DELETE FROM videos v
                 WHERE v.id NOT IN (
@@ -199,6 +232,7 @@ def init_db():
             cur.execute("UPDATE videos SET collection = LOWER(collection) WHERE collection != LOWER(collection)")
             cur.execute("UPDATE sent_videos SET collection = LOWER(collection) WHERE collection != LOWER(collection)")
             
+            # Auto-expire old videos if expiry is set
             cur.execute("""
                 DELETE FROM videos v
                 WHERE EXISTS (
