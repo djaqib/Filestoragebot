@@ -1235,8 +1235,20 @@ async def find_video_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     await query.answer("📤 Sending video...")
     
-    _, token, idx_str = query.data.split(":", 2)
-    idx = int(idx_str)
+    # Parse: findvideo:{token}:{idx}
+    # But the token already contains the collection name
+    data = query.data
+    parts = data.split(":", 2)  # Split into 3 parts: findvideo, token, idx
+    if len(parts) != 3:
+        await query.answer("Invalid selection.")
+        return
+    
+    _, token, idx_str = parts
+    try:
+        idx = int(idx_str)
+    except ValueError:
+        await query.answer("Invalid selection.")
+        return
     
     result_data = _find_results.get(token)
     if not result_data:
@@ -1275,8 +1287,8 @@ async def find_video_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 document=fid,
                 caption=caption
             )
-        except TelegramError:
-            await context.bot.send_message(chat_id, "⚠️ Failed to send video (might be dead).")
+        except TelegramError as e:
+            await context.bot.send_message(chat_id, f"⚠️ Failed to send video: {str(e)[:100]}")
 
 async def find_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send all videos from find results as an album"""
