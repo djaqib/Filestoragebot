@@ -45,14 +45,14 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "2026-08-27-1"  # Updated version
+BOT_VERSION = "2026-08-27-3"
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
 RENDER_EXTERNAL_URL = os.environ["RENDER_EXTERNAL_URL"]
 DATABASE_URL = os.environ["DATABASE_URL"]
 BACKUP_CHANNEL_ID = int(os.environ.get("BACKUP_CHANNEL_ID", 0))
-ADMIN_LOG_CHANNEL = int(os.environ.get("ADMIN_LOG_CHANNEL", 0))  # New: Admin log channel
+ADMIN_LOG_CHANNEL = int(os.environ.get("ADMIN_LOG_CHANNEL", 0))
 PORT = int(os.environ.get("PORT", 10000))
 
 _raw_allowed = os.environ["ALLOWED_USER_IDS"]
@@ -66,10 +66,11 @@ RESERVED_NAMES = {"default", "all"}
 BATCH_DEBOUNCE_SECONDS = 2.5
 LIST_PAGE_SIZE = 30
 ALBUM_SIZE = 10
-ALBUM_DELAY_SECONDS = 1.5  # Reduced from 3 for faster delivery
+ALBUM_DELAY_SECONDS = 1.5
 GET_PAGE_SIZE = 50
 NEARDUPES_PAIRS_PER_PAGE = 10
 NEARDUP_ALBUM_DELAY = 1.5
+FIND_PAGE_SIZE = 15  # Results per page for /find (reduced for cleaner display)
 
 NEAR_DUP_DURATION_TOLERANCE_SECONDS = 2
 NEAR_DUP_SIZE_TOLERANCE_FRACTION = 0.02
@@ -99,7 +100,6 @@ def rate_limit(user_id: int, key: str = "global") -> bool:
     return True
 
 async def log_to_admin_channel(message: str, context: ContextTypes.DEFAULT_TYPE):
-    """Send log messages to admin channel if configured"""
     if ADMIN_LOG_CHANNEL:
         try:
             await context.bot.send_message(chat_id=ADMIN_LOG_CHANNEL, text=message)
@@ -142,14 +142,13 @@ async def db_run(fn):
 def init_db():
     def _init(conn):
         with conn.cursor() as cur:
-            # Main videos table
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS videos (
                     id SERIAL PRIMARY KEY,
                     collection TEXT NOT NULL,
                     file_id TEXT NOT NULL,
                     file_unique_id TEXT NOT NULL,
-                    file_name TEXT,  -- NEW: store original filename
+                    file_name TEXT,
                     added_at TIMESTAMPTZ DEFAULT NOW(),
                     duration INTEGER,
                     file_size BIGINT,
@@ -157,7 +156,6 @@ def init_db():
                 )
             """)
             
-            # Sent videos tracking
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS sent_videos (
                     chat_id BIGINT NOT NULL,
@@ -168,12 +166,11 @@ def init_db():
                 )
             """)
             
-            # Indexes for performance
             cur.execute("CREATE INDEX IF NOT EXISTS idx_videos_collection_added_at ON videos (collection, added_at)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_videos_collection_filesize ON videos (collection, file_size)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_videos_file_name ON videos (file_name)")  # NEW
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_videos_file_name ON videos (file_name)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_videos_duration ON videos (duration)")  # NEW for faster duration search
             
-            # Dead files tracking
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS dead_files (
                     file_unique_id TEXT PRIMARY KEY,
@@ -182,7 +179,6 @@ def init_db():
                 )
             """)
             
-            # NEW: Expiry settings per collection
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS collection_settings (
                     collection TEXT PRIMARY KEY,
@@ -191,10 +187,8 @@ def init_db():
                 )
             """)
             
-            # Clean up old dead files (older than 30 days)
             cur.execute("DELETE FROM dead_files WHERE detected_at < NOW() - INTERVAL '30 days'")
             
-            # Remove duplicates
             cur.execute("""
                 DELETE FROM videos v
                 WHERE v.id NOT IN (
@@ -205,7 +199,6 @@ def init_db():
             cur.execute("UPDATE videos SET collection = LOWER(collection) WHERE collection != LOWER(collection)")
             cur.execute("UPDATE sent_videos SET collection = LOWER(collection) WHERE collection != LOWER(collection)")
             
-            # NEW: Auto-expire old videos if expiry is set
             cur.execute("""
                 DELETE FROM videos v
                 WHERE EXISTS (
@@ -241,7 +234,6 @@ paused_chats: Set[int] = set()
 removing_chats: Set[int] = set()
 min_video_length: Dict[int, Optional[int]] = {}
 
-# Per-chat toggles for accepting photos and files
 accept_photos: Set[int] = set()
 accept_files: Set[int] = set()
 
@@ -249,6 +241,9 @@ _batch_state: Dict[int, BatchState] = {}
 _delete_batch_state: Dict[int, DeleteBatchState] = {}
 _pending_deletes: Dict[str, str] = {}
 _active_tasks: Dict[int, asyncio.Task] = {}
+
+# Store find results for pagination
+_find_results: Dict[str, Dict] = {}
 
 def _track_task(chat_id: int, task: asyncio.Task):
     _active_tasks[chat_id] = task
@@ -300,7 +295,7 @@ def _parse_collection_names(raw: str) -> List[str]:
     for n in names:
         if n not in seen:
             seen.append(n)
-    return seen
+    return names
 
 def _parse_arrow_pair(args: List[str]) -> Optional[Tuple[str, str]]:
     raw = " ".join(args)
@@ -465,7 +460,8 @@ HELP_TEXT = (
     "/setexpiry <collection> <days> - Auto-delete videos after X days\n\n"
     "*Search & Find:*\n"
     "/search <collection> <text> - Search videos by filename\n"
-    "/find <collection> [duration:>60] [size:<100MB] - Filter videos\n\n"
+    "/find <collection> [duration:>60] [size:<100MB] - Filter videos\n"
+    "  Use only duration:>15 to ignore file size\n\n"
     "More commands available in /settings → subcategories"
 )
 
@@ -616,7 +612,7 @@ async def menu_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await show_menu(update.effective_chat.id, context, text="Back to main menu:")
 
 # ----------------------------------------------------------------------
-# Helper for /get and /getbysize from callback context
+# Helper for /get
 # ----------------------------------------------------------------------
 
 async def _get_collection_impl_from_callback(chat_id: int, name: str, context: ContextTypes.DEFAULT_TYPE, order_by: str = "added_at"):
@@ -886,7 +882,7 @@ async def list_random_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await show_menu(chat_id, context, text="Back to menu:")
 
 # ----------------------------------------------------------------------
-# /random implementation with "Next" button
+# /random implementation
 # ----------------------------------------------------------------------
 
 async def _send_random_impl(chat_id: int, context: ContextTypes.DEFAULT_TYPE, name: str, count: int):
@@ -968,7 +964,6 @@ async def random_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ----------------------------------------------------------------------
 
 async def search_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Search for videos by filename in a collection"""
     chat_id = update.effective_chat.id
     if not context.args or len(context.args) < 2:
         await update.message.reply_text(
@@ -987,7 +982,7 @@ async def search_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     """SELECT file_id, file_unique_id, duration, file_size, file_name, added_at 
                        FROM videos 
                        WHERE collection = %s AND LOWER(file_name) LIKE %s 
-                       ORDER BY added_at DESC LIMIT 20""",
+                       ORDER BY added_at DESC""",
                     (collection, f"%{search_text}%")
                 )
                 return cur.fetchall()
@@ -1000,75 +995,329 @@ async def search_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"No videos found in '{collection}' matching '{search_text}'.")
         return
     
-    # Send results
-    lines = [f"🔍 Found {len(rows)} videos in '{collection}':\n"]
-    for i, (fid, fuid, dur, size, fname, added) in enumerate(rows, 1):
-        fname_display = fname or "unknown"
+    # Send results with pagination
+    await _send_find_results(update, context, rows, collection, search_text, page=1)
+
+# ----------------------------------------------------------------------
+# Enhanced /find command with pagination and clickable results
+# ----------------------------------------------------------------------
+
+async def find_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Search videos with filters - now with pagination and clickable results"""
+    chat_id = update.effective_chat.id
+    if not rate_limit(chat_id, "find"):
+        await update.message.reply_text("⏳ Please wait.")
+        return
+    
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "Usage: /find <collection> [duration:>60] [size:<100MB]\n"
+            "Operators: >, <, >=, <=, =\n"
+            "Examples:\n"
+            "  /find mycollection duration:>30\n"
+            "  /find mycollection size:<100MB\n"
+            "  /find mycollection duration:>15 size:>50MB\n"
+            "  /find mycollection duration:>15 (ignores file size)"
+        )
+        return
+
+    collection = normalize_name(args[0])
+    filters_raw = args[1:]
+    
+    # Parse filters
+    dur_filter = None
+    size_filter = None
+    for f in filters_raw:
+        if f.startswith("duration:"):
+            dur_filter = f[len("duration:"):]
+        elif f.startswith("size:"):
+            size_filter = f[len("size:"):]
+
+    conditions = []
+    params = [collection]
+    
+    if dur_filter:
+        try:
+            op, val = _parse_filter(dur_filter)
+            conditions.append(f"duration {op} %s")
+            params.append(val)
+        except ValueError:
+            pass
+    
+    if size_filter:
+        try:
+            # Remove MB/mb suffix
+            size_val = size_filter.replace("MB", "").replace("mb", "").strip()
+            op, val = _parse_filter(size_val)
+            conditions.append(f"file_size {op} %s")
+            params.append(int(val * 1024 * 1024))
+        except ValueError:
+            pass
+
+    where = " AND ".join(conditions) if conditions else "1=1"
+    
+    # Add LIMIT and OFFSET - we'll fetch all matching videos for pagination
+    try:
+        def _query(conn):
+            with conn.cursor() as cur:
+                query = f"""
+                    SELECT file_id, file_unique_id, duration, file_size, added_at, file_name 
+                    FROM videos 
+                    WHERE collection = %s AND {where} 
+                    ORDER BY duration DESC, added_at DESC
+                """
+                logger.info(f"Find query: {query} with params {params}")
+                cur.execute(query, params)
+                return cur.fetchall()
+        rows = await db_run(_query)
+    except Exception as e:
+        await reply_db_error(update, f"search '{collection}'", e)
+        return
+
+    if not rows:
+        await update.message.reply_text(f"No videos found in '{collection}' matching your filters.")
+        return
+
+    # Store results for pagination
+    token = f"{chat_id}:find:{collection}"
+    _find_results[token] = {
+        'rows': rows,
+        'collection': collection,
+        'filters': filters_raw,
+        'total': len(rows)
+    }
+    
+    # Send first page
+    await _send_find_page(update, context, token, rows, page=1)
+
+async def _send_find_page(update: Update, context: ContextTypes.DEFAULT_TYPE, token: str, rows: List, page: int):
+    """Send a single page of find results"""
+    chat_id = update.effective_chat.id
+    total = len(rows)
+    total_pages = (total + FIND_PAGE_SIZE - 1) // FIND_PAGE_SIZE
+    
+    if page > total_pages:
+        page = total_pages
+    
+    start_idx = (page - 1) * FIND_PAGE_SIZE
+    end_idx = min(start_idx + FIND_PAGE_SIZE, total)
+    page_rows = rows[start_idx:end_idx]
+    
+    # Get collection name from stored data
+    result_data = _find_results.get(token, {})
+    collection = result_data.get('collection', 'unknown')
+    filters = result_data.get('filters', [])
+    
+    # Build the message
+    header = f"🔍 Found {total} video(s) in '{collection}'"
+    if filters:
+        header += f"\n📋 Filters: {' '.join(filters)}"
+    header += f"\n📄 Page {page}/{total_pages}\n"
+    
+    # Build the list with clickable buttons
+    lines = []
+    buttons = []
+    
+    for idx, row in enumerate(page_rows, start=start_idx + 1):
+        fid, fuid, dur, size, added, fname = row
+        fname_display = fname or f"video_{idx}"
         dur_str = f"{dur}s" if dur else "?s"
         size_str = f"{size/1024/1024:.1f}MB" if size else "?MB"
-        lines.append(f"{i}. 📄 {fname_display} — {dur_str} / {size_str}")
+        date_str = added.strftime('%Y-%m-%d %H:%M') if added else "?"
+        
+        # Add to list (shorter format)
+        lines.append(f"{idx}. {dur_str} / {size_str} — {date_str}")
+        
+        # Create a button for each video (limited to avoid too many buttons)
+        # Each button will send the video when clicked
+        button_label = f"▶️ {idx}"
+        buttons.append([InlineKeyboardButton(button_label, callback_data=f"findvideo:{token}:{idx-1}")])
     
-    await update.message.reply_text("\n".join(lines[:10]))
-    if len(lines) > 10:
-        await update.message.reply_text(f"...and {len(lines)-10} more. Use /get {collection} to view all.")
-
-# ----------------------------------------------------------------------
-# Set expiry for collection
-# ----------------------------------------------------------------------
-
-async def set_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Set auto-deletion expiry for a collection"""
-    if not await admin_check(update):
-        return
+    # Send the text
+    message_text = header + "\n".join(lines)
     
-    if len(context.args) != 2:
+    # Navigation buttons
+    nav_buttons = []
+    if page > 1:
+        nav_buttons.append(InlineKeyboardButton("◀️ Previous", callback_data=f"findpage:{token}:{page-1}"))
+    if page < total_pages:
+        nav_buttons.append(InlineKeyboardButton("Next ▶️", callback_data=f"findpage:{token}:{page+1}"))
+    if nav_buttons:
+        buttons.append(nav_buttons)
+    
+    # Add "View All" option (sends all videos in an album)
+    if total > FIND_PAGE_SIZE:
+        buttons.append([InlineKeyboardButton(f"📤 Send All {total} Videos", callback_data=f"findall:{token}")])
+    
+    buttons.append([InlineKeyboardButton("❌ Close", callback_data=f"findclose:{token}")])
+    
+    if update.message:
         await update.message.reply_text(
-            "Usage: /setexpiry <collection> <days>\n"
-            "Example: /setexpiry temp 7  (auto-delete after 7 days)\n"
-            "Use 0 days to disable expiry"
+            message_text,
+            reply_markup=InlineKeyboardMarkup(buttons)
         )
-        return
-    
-    collection = normalize_name(context.args[0])
-    try:
-        days = int(context.args[1])
-        if days < 0:
-            await update.message.reply_text("Days must be 0 or positive.")
-            return
-    except ValueError:
-        await update.message.reply_text("Please provide a valid number of days.")
-        return
-    
-    try:
-        def _set_expiry(conn):
-            with conn.cursor() as cur:
-                if days == 0:
-                    cur.execute("DELETE FROM collection_settings WHERE collection = %s", (collection,))
-                    return "disabled"
-                else:
-                    cur.execute(
-                        """INSERT INTO collection_settings (collection, expiry_days) 
-                           VALUES (%s, %s) 
-                           ON CONFLICT (collection) DO UPDATE SET expiry_days = EXCLUDED.expiry_days""",
-                        (collection, days)
-                    )
-                    return days
-        result = await db_run(_set_expiry)
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Failed to set expiry: {str(e)}")
-        return
-    
-    if result == "disabled":
-        await update.message.reply_text(f"✅ Auto-deletion disabled for '{collection}'.")
     else:
-        await update.message.reply_text(f"✅ Videos in '{collection}' will auto-delete after {days} days.")
-        await log_to_admin_channel(
-            f"🗑️ Expiry set: {collection} -> {days} days by {update.effective_user.username or update.effective_user.id}",
-            context
+        # Called from callback
+        await update.callback_query.edit_message_text(
+            message_text,
+            reply_markup=InlineKeyboardMarkup(buttons)
         )
 
+async def _send_find_results(update: Update, context: ContextTypes.DEFAULT_TYPE, rows: List, collection: str, search_text: str, page: int):
+    """Send search results with pagination"""
+    chat_id = update.effective_chat.id
+    token = f"{chat_id}:search:{collection}"
+    _find_results[token] = {
+        'rows': rows,
+        'collection': collection,
+        'filters': [f'search: "{search_text}"'],
+        'total': len(rows)
+    }
+    await _send_find_page(update, context, token, rows, page)
+
 # ----------------------------------------------------------------------
-# Core video handling and other commands
+# Find command callbacks
+# ----------------------------------------------------------------------
+
+async def find_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle page navigation for find results"""
+    query = update.callback_query
+    await query.answer()
+    
+    _, token, page_str = query.data.split(":", 2)
+    page = int(page_str)
+    
+    result_data = _find_results.get(token)
+    if not result_data:
+        await query.edit_message_text("⏱️ These results have expired. Please run /find again.")
+        return
+    
+    rows = result_data['rows']
+    await _send_find_page(update, context, token, rows, page)
+
+async def find_video_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send a single video from find results"""
+    query = update.callback_query
+    await query.answer("📤 Sending video...")
+    
+    _, token, idx_str = query.data.split(":", 2)
+    idx = int(idx_str)
+    
+    result_data = _find_results.get(token)
+    if not result_data:
+        await query.edit_message_text("⏱️ These results have expired. Please run /find again.")
+        return
+    
+    rows = result_data['rows']
+    if idx >= len(rows):
+        await query.answer("Invalid selection.")
+        return
+    
+    row = rows[idx]
+    fid, fuid, dur, size, added, fname = row
+    chat_id = update.effective_chat.id
+    
+    # Build caption
+    caption = f"📹 From search results"
+    if fname:
+        caption += f"\n📄 {fname}"
+    if dur is not None and size is not None:
+        caption += f"\n⏱ {dur}s • 📦 {size/1024/1024:.1f}MB"
+    if added:
+        caption += f"\n📅 {added.strftime('%Y-%m-%d %H:%M')}"
+    
+    try:
+        await context.bot.send_video(
+            chat_id=chat_id,
+            video=fid,
+            caption=caption
+        )
+    except TelegramError:
+        # Try sending as document
+        try:
+            await context.bot.send_document(
+                chat_id=chat_id,
+                document=fid,
+                caption=caption
+            )
+        except TelegramError:
+            await context.bot.send_message(chat_id, "⚠️ Failed to send video (might be dead).")
+
+async def find_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send all videos from find results as an album"""
+    query = update.callback_query
+    await query.answer("📤 Sending all videos...")
+    
+    _, token = query.data.split(":", 1)
+    
+    result_data = _find_results.get(token)
+    if not result_data:
+        await query.edit_message_text("⏱️ These results have expired. Please run /find again.")
+        return
+    
+    rows = result_data['rows']
+    chat_id = update.effective_chat.id
+    
+    if not rows:
+        await query.edit_message_text("No videos to send.")
+        return
+    
+    await query.edit_message_text(f"📤 Sending {len(rows)} videos... This may take a moment.")
+    
+    # Send in albums of 10
+    album_size = 10
+    sent = 0
+    failed = 0
+    
+    for i in range(0, len(rows), album_size):
+        batch = rows[i:i + album_size]
+        
+        # Try sending as album
+        try:
+            media_group = []
+            for j, row in enumerate(batch):
+                fid, fuid, dur, size, added, fname = row
+                caption = f"📹 {i+j+1}/{len(rows)}"
+                if fname:
+                    caption += f"\n📄 {fname}"
+                media_group.append(InputMediaVideo(media=fid, caption=caption if j == 0 else None))
+            
+            await context.bot.send_media_group(chat_id=chat_id, media=media_group)
+            sent += len(batch)
+        except Exception as e:
+            # Fallback: send individually
+            for row in batch:
+                fid, fuid, dur, size, added, fname = row
+                try:
+                    caption = f"📹 {i+1}/{len(rows)}"
+                    if fname:
+                        caption += f"\n📄 {fname}"
+                    await context.bot.send_video(chat_id=chat_id, video=fid, caption=caption)
+                    sent += 1
+                except Exception:
+                    failed += 1
+                await asyncio.sleep(0.3)
+        
+        await asyncio.sleep(1.5)  # Delay between albums
+    
+    await context.bot.send_message(
+        chat_id,
+        f"✅ Sent {sent} videos, {failed} failed."
+    )
+
+async def find_close_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Close find results"""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("🔍 Search closed.")
+    
+    # Clean up stored results
+    _, token = query.data.split(":", 1)
+    _find_results.pop(token, None)
+
+# ----------------------------------------------------------------------
+# Core video handling
 # ----------------------------------------------------------------------
 
 async def _save_video_to_collection(
@@ -1131,7 +1380,6 @@ async def _save_video_to_collection(
                 return inserted, possible_near_dup
             except Exception as e:
                 if "duration" in str(e) or "file_size" in str(e) or "file_name" in str(e):
-                    # Fallback without new columns
                     logger.warning("Columns missing, saving without extra fields.")
                     cur.execute(
                         """
@@ -1175,7 +1423,6 @@ async def _mark_dead_file(file_unique_id: str, collection: str):
 # ----------------------------------------------------------------------
 
 async def _backup_to_channel(file_id: str, collection: str, context: ContextTypes.DEFAULT_TYPE):
-    """Asynchronously backup a video to the configured backup channel."""
     if not BACKUP_CHANNEL_ID:
         return
     
@@ -1433,7 +1680,7 @@ def _build_page_jump_buttons(chat_id: int, name: str, total_pages: int, current_
     return grid_rows
 
 # ----------------------------------------------------------------------
-# /get, /getbysize commands
+# /get, /getbysize commands (keeping your existing code)
 # ----------------------------------------------------------------------
 
 async def _get_collection_impl(
@@ -1722,11 +1969,10 @@ async def admin_check(update: Update) -> bool:
     return True
 
 # ----------------------------------------------------------------------
-# Settings Menu (Updated with new features)
+# Settings Menu
 # ----------------------------------------------------------------------
 
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show interactive settings menu with toggle buttons and command categories"""
     chat_id = update.effective_chat.id
     
     photos_status = "✅ ON" if chat_id in accept_photos else "⭕ OFF"
@@ -1764,7 +2010,6 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle settings menu button taps"""
     query = update.callback_query
     chat_id = update.effective_chat.id
     action = query.data.split(":")[1]
@@ -1838,9 +2083,11 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "find_help":
         await query.answer()
         await query.edit_message_text(
-            "/find <collection> - Search with filters\n"
-            "Example: `/find default duration:>60 size:<100MB`\n\n"
-            "/search <text> - Search in collection (case-insensitive)",
+            "/find <collection> [duration:>60] [size:<100MB]\n\n"
+            "Examples:\n"
+            "  `/find default duration:>15` (only duration filter)\n"
+            "  `/find default size:<50MB` (only size filter)\n"
+            "  `/find default duration:>15 size:>50MB` (both filters)",
             parse_mode="Markdown"
         )
     
@@ -2143,98 +2390,735 @@ async def remove_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Already removed from '{collection}'.")
 
 # ----------------------------------------------------------------------
-# Admin commands (rename, merge, copy, export, exportjson, importjson, delete, backup)
+# Admin commands
 # ----------------------------------------------------------------------
 
-# (The admin commands remain the same as in your original code)
-# I've included them in the full file above. Here's a summary:
+async def set_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await admin_check(update):
+        return
+    
+    if len(context.args) != 2:
+        await update.message.reply_text(
+            "Usage: /setexpiry <collection> <days>\n"
+            "Example: /setexpiry temp 7  (auto-delete after 7 days)\n"
+            "Use 0 days to disable expiry"
+        )
+        return
+    
+    collection = normalize_name(context.args[0])
+    try:
+        days = int(context.args[1])
+        if days < 0:
+            await update.message.reply_text("Days must be 0 or positive.")
+            return
+    except ValueError:
+        await update.message.reply_text("Please provide a valid number of days.")
+        return
+    
+    try:
+        def _set_expiry(conn):
+            with conn.cursor() as cur:
+                if days == 0:
+                    cur.execute("DELETE FROM collection_settings WHERE collection = %s", (collection,))
+                    return "disabled"
+                else:
+                    cur.execute(
+                        """INSERT INTO collection_settings (collection, expiry_days) 
+                           VALUES (%s, %s) 
+                           ON CONFLICT (collection) DO UPDATE SET expiry_days = EXCLUDED.expiry_days""",
+                        (collection, days)
+                    )
+                    return days
+        result = await db_run(_set_expiry)
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Failed to set expiry: {str(e)}")
+        return
+    
+    if result == "disabled":
+        await update.message.reply_text(f"✅ Auto-deletion disabled for '{collection}'.")
+    else:
+        await update.message.reply_text(f"✅ Videos in '{collection}' will auto-delete after {days} days.")
+        await log_to_admin_channel(
+            f"🗑️ Expiry set: {collection} -> {days} days by {update.effective_user.username or update.effective_user.id}",
+            context
+        )
 
 async def rename_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (same as original)
-    pass
+    if not await admin_check(update):
+        return
+    pair = _parse_arrow_pair(context.args)
+    if not pair:
+        await update.message.reply_text("Usage: /rename <old> -> <new>")
+        return
+    old, new = pair
+    if new in RESERVED_NAMES:
+        await update.message.reply_text(f"⚠️ '{new}' is reserved.")
+        return
+    try:
+        def _rename(conn):
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM videos WHERE collection = %s LIMIT 1", (old,))
+                if not cur.fetchone():
+                    return "not_found"
+                cur.execute("SELECT 1 FROM videos WHERE collection = %s LIMIT 1", (new,))
+                if cur.fetchone():
+                    return "conflict"
+                cur.execute("UPDATE videos SET collection = %s WHERE collection = %s", (new, old))
+                cur.execute("UPDATE sent_videos SET collection = %s WHERE collection = %s", (new, old))
+                return "ok"
+        result = await db_run(_rename)
+    except Exception:
+        await reply_db_error(update, "rename")
+        return
+    if result == "not_found":
+        await update.message.reply_text(f"No collection '{old}'.")
+    elif result == "conflict":
+        await update.message.reply_text(f"'{new}' already exists. Use /merge or /copy.")
+    else:
+        await update.message.reply_text(f"✏️ Renamed '{old}' to '{new}'.")
 
 async def merge_collections(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (same as original)
-    pass
+    if not await admin_check(update):
+        return
+    pair = _parse_arrow_pair(context.args)
+    if not pair:
+        await update.message.reply_text("Usage: /merge <source> -> <dest>")
+        return
+    src, dest = pair
+    if src == dest:
+        await update.message.reply_text("Source and destination must differ.")
+        return
+    try:
+        def _merge(conn):
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM videos WHERE collection = %s LIMIT 1", (src,))
+                if not cur.fetchone():
+                    return "not_found", 0
+                cur.execute(
+                    """
+                    UPDATE videos v1
+                    SET collection = %s
+                    WHERE v1.collection = %s
+                      AND NOT EXISTS (
+                          SELECT 1 FROM videos v2
+                          WHERE v2.collection = %s AND v2.file_unique_id = v1.file_unique_id
+                      )
+                    """,
+                    (dest, src, dest),
+                )
+                moved = cur.rowcount
+                cur.execute("DELETE FROM videos WHERE collection = %s", (src,))
+                cur.execute("UPDATE sent_videos SET collection = %s WHERE collection = %s", (dest, src))
+                return "ok", moved
+        result, moved = await db_run(_merge)
+    except Exception:
+        await reply_db_error(update, "merge")
+        return
+    if result == "not_found":
+        await update.message.reply_text(f"No collection '{src}'.")
+    else:
+        await update.message.reply_text(f"🔀 Merged '{src}' into '{dest}' ({moved} moved).")
 
 async def copy_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (same as original)
-    pass
+    if not await admin_check(update):
+        return
+    pair = _parse_arrow_pair(context.args)
+    if not pair:
+        await update.message.reply_text("Usage: /copy <source> -> <dest>")
+        return
+    src, dest = pair
+    if src == dest:
+        await update.message.reply_text("Source and destination must differ.")
+        return
+    if dest in RESERVED_NAMES:
+        await update.message.reply_text(f"⚠️ '{dest}' is reserved.")
+        return
+    try:
+        def _copy(conn):
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM videos WHERE collection = %s LIMIT 1", (src,))
+                if not cur.fetchone():
+                    return "not_found", 0
+                cur.execute(
+                    """
+                    INSERT INTO videos (collection, file_id, file_unique_id)
+                    SELECT %s, file_id, file_unique_id
+                    FROM videos
+                    WHERE collection = %s
+                    ON CONFLICT (collection, file_unique_id) DO NOTHING
+                    """,
+                    (dest, src),
+                )
+                copied = cur.rowcount
+                return "ok", copied
+        result, copied = await db_run(_copy)
+    except Exception:
+        await reply_db_error(update, "copy")
+        return
+    if result == "not_found":
+        await update.message.reply_text(f"No collection '{src}'.")
+    else:
+        await update.message.reply_text(f"📋 Copied {copied} videos to '{dest}'.")
 
 async def export_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (same as original)
-    pass
+    if not context.args:
+        await update.message.reply_text("Usage: /export <name>")
+        return
+    name = normalize_name(" ".join(context.args))
+    try:
+        def _query(conn):
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT file_id, file_unique_id, added_at FROM videos WHERE collection = %s ORDER BY added_at",
+                    (name,),
+                )
+                return cur.fetchall()
+        rows = await db_run(_query)
+    except Exception:
+        await reply_db_error(update, "export")
+        return
+    if not rows:
+        await update.message.reply_text(f"No videos in '{name}'.")
+        return
+    lines = [f"# Export of '{name}' — {len(rows)} videos"]
+    lines.append("# file_id\tfile_unique_id\tadded_at")
+    for fid, fu, added in rows:
+        lines.append(f"{fid}\t{fu}\t{added.isoformat()}")
+    content = "\n".join(lines)
+    bio = io.BytesIO(content.encode("utf-8"))
+    bio.name = f"{name}_export.txt"
+    await update.message.reply_document(document=bio, filename=f"{name}_export.txt", caption=f"📦 Backup of '{name}'.")
 
 async def exportjson(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (same as original)
-    pass
+    if not await admin_check(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /exportjson <name>")
+        return
+    name = normalize_name(" ".join(context.args))
+    try:
+        def _query(conn):
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT file_id, file_unique_id, duration, file_size, added_at, file_name FROM videos WHERE collection = %s ORDER BY added_at",
+                    (name,),
+                )
+                rows = cur.fetchall()
+                return [{"file_id": r[0], "file_unique_id": r[1], "duration": r[2], "file_size": r[3], "added_at": r[4].isoformat() if r[4] else None, "file_name": r[5]} for r in rows]
+        data = await db_run(_query)
+    except Exception:
+        await reply_db_error(update, "export JSON")
+        return
+    if not data:
+        await update.message.reply_text(f"No videos in '{name}'.")
+        return
+    json_str = json.dumps({"collection": name, "videos": data}, indent=2)
+    bio = io.BytesIO(json_str.encode("utf-8"))
+    bio.name = f"{name}_export.json"
+    await update.message.reply_document(document=bio, filename=f"{name}_export.json", caption=f"📦 JSON export of '{name}'.")
 
 async def importjson(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (same as original)
-    pass
+    if not await admin_check(update):
+        return
+    replied = update.message.reply_to_message
+    if not replied or not replied.document:
+        await update.message.reply_text("Reply to a JSON file exported from this bot.")
+        return
+    doc = replied.document
+    if doc.mime_type not in ("application/json", "text/json") and not doc.file_name.endswith(".json"):
+        await update.message.reply_text("Please send a JSON file.")
+        return
+    try:
+        file = await context.bot.get_file(doc.file_id)
+        content = await file.download_as_bytearray()
+        data = json.loads(content.decode("utf-8"))
+        collection = data.get("collection")
+        videos = data.get("videos", [])
+        if not collection or not videos:
+            await update.message.reply_text("Invalid JSON format.")
+            return
+        def _insert(conn):
+            with conn.cursor() as cur:
+                inserted = 0
+                for v in videos:
+                    fid = v.get("file_id")
+                    fu = v.get("file_unique_id")
+                    if not fid or not fu:
+                        continue
+                    dur = v.get("duration")
+                    size = v.get("file_size")
+                    fname = v.get("file_name")
+                    cur.execute(
+                        """
+                        INSERT INTO videos (collection, file_id, file_unique_id, duration, file_size, file_name)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (collection, file_unique_id) DO NOTHING
+                        """,
+                        (collection, fid, fu, dur, size, fname),
+                    )
+                    if cur.rowcount:
+                        inserted += 1
+                return inserted
+        inserted = await db_run(_insert)
+        await update.message.reply_text(f"✅ Imported {inserted} video(s) into '{collection}'.")
+    except Exception as e:
+        logger.exception("Import failed")
+        await update.message.reply_text(f"⚠️ Import failed: {e}")
 
 async def delete_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (same as original)
-    pass
+    if not await admin_check(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /delete <name>")
+        return
+    name = normalize_name(" ".join(context.args))
+    chat_id = update.effective_chat.id
+    try:
+        def _count(conn):
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM videos WHERE collection = %s", (name,))
+                return cur.fetchone()[0]
+        count = await db_run(_count)
+    except Exception:
+        await reply_db_error(update, "count")
+        return
+    if count == 0:
+        await update.message.reply_text(f"No collection '{name}'.")
+        return
+    token = f"{chat_id}:{name}:{update.message.message_id}"
+    _pending_deletes[token] = name
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Yes, delete", callback_data=f"delconfirm:{token}"),
+         InlineKeyboardButton("❌ Cancel", callback_data=f"delcancel:{token}")]
+    ])
+    await update.message.reply_text(f"⚠️ Delete '{name}' ({count} videos)?", reply_markup=keyboard)
 
 async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (same as original)
-    pass
+    query = update.callback_query
+    action, token = query.data.split(":", 1)
+    name = _pending_deletes.pop(token, None)
+    if name is None:
+        await query.answer("Expired.")
+        await query.edit_message_text("⏱️ This confirmation expired.")
+        return
+    if action == "delcancel":
+        await query.answer("Cancelled.")
+        await query.edit_message_text(f"❎ Cancelled — '{name}' not deleted.")
+        return
+    await query.answer("Deleting...")
+    try:
+        def _delete(conn):
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM videos WHERE collection = %s", (name,))
+                deleted = cur.rowcount
+                cur.execute("DELETE FROM sent_videos WHERE collection = %s", (name,))
+                return deleted
+        deleted = await db_run(_delete)
+    except Exception:
+        logger.exception("Delete failed for '%s'", name)
+        await query.edit_message_text(f"⚠️ Couldn't delete '{name}'.")
+        return
+    await query.edit_message_text(f"🗑️ Deleted '{name}' ({deleted} videos).")
 
 async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (same as original)
-    pass
+    if not await admin_check(update):
+        return
+    try:
+        def _backup(conn):
+            with conn.cursor() as cur:
+                cur.execute("SELECT collection, file_id, file_unique_id, duration, file_size, added_at, file_name FROM videos ORDER BY collection, added_at")
+                rows = cur.fetchall()
+                return [{"collection": r[0], "file_id": r[1], "file_unique_id": r[2], "duration": r[3], "file_size": r[4], "added_at": r[5].isoformat() if r[5] else None, "file_name": r[6]} for r in rows]
+        data = await db_run(_backup)
+        if not data:
+            await update.message.reply_text("No videos to backup.")
+            return
+        json_str = json.dumps(data, indent=2)
+        bio = io.BytesIO(json_str.encode("utf-8"))
+        bio.name = "full_backup.json"
+        await update.message.reply_document(document=bio, filename="full_backup.json", caption="📦 Full database backup.")
+    except Exception:
+        await reply_db_error(update, "backup")
 
 # ----------------------------------------------------------------------
-# Status, neardupes, dups, recent, cleanup, stats, find
+# Status, neardupes, dups, recent, cleanup, stats
 # ----------------------------------------------------------------------
-
-# (These remain largely the same as in your original code)
-# I've included them in the full file above.
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (same as original)
-    pass
+    chat_id = update.effective_chat.id
+    collections = get_active_collections(chat_id)
+    try:
+        def _query(conn):
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT collection, COUNT(*) FROM videos WHERE collection = ANY(%s) GROUP BY collection",
+                    (collections,),
+                )
+                return dict(cur.fetchall())
+        counts = await db_run(_query)
+    except Exception:
+        await reply_db_error(update, "status")
+        return
+    if len(collections) == 1:
+        c = collections[0]
+        await update.message.reply_text(f"📦 '{c}' has {counts.get(c, 0)} video(s).")
+    else:
+        lines = [f"• '{c}' — {counts.get(c, 0)}" for c in collections]
+        await update.message.reply_text("📦 Active collections:\n" + "\n".join(lines))
 
 async def neardupes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (same as original)
-    pass
+    if not rate_limit(update.effective_chat.id, "neardupes"):
+        await update.message.reply_text("⏳ Please wait.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /neardupes <collection>")
+        return
+    name = normalize_name(" ".join(context.args))
+    try:
+        def _find(conn):
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT 
+                        v1.file_id, v1.file_unique_id, v1.duration, v1.file_size,
+                        v2.file_id, v2.file_unique_id, v2.duration, v2.file_size,
+                        ABS(v1.duration - v2.duration) as dur_diff,
+                        ABS(v1.file_size - v2.file_size) as size_diff,
+                        CASE 
+                            WHEN v1.file_size > 0 THEN ROUND(ABS(v1.file_size - v2.file_size)::numeric / v1.file_size * 100, 2)
+                            ELSE 0 
+                        END as size_pct
+                    FROM videos v1
+                    JOIN videos v2 ON v1.collection = v2.collection AND v1.file_unique_id < v2.file_unique_id
+                    WHERE v1.collection = %s
+                      AND v1.file_size IS NOT NULL AND v2.file_size IS NOT NULL
+                      AND (
+                          (v1.duration IS NOT NULL AND v2.duration IS NOT NULL
+                           AND ABS(v1.duration - v2.duration) <= 2
+                           AND v2.file_size BETWEEN v1.file_size * 0.98 AND v1.file_size * 1.02)
+                          OR
+                          ((v1.duration IS NULL OR v2.duration IS NULL)
+                           AND v2.file_size BETWEEN v1.file_size * 0.995 AND v1.file_size * 1.005)
+                      )
+                    ORDER BY size_pct DESC, dur_diff DESC
+                    """,
+                    (name,),
+                )
+                return cur.fetchall()
+        pairs = await db_run(_find)
+    except Exception:
+        await reply_db_error(update, "find near-dupes")
+        return
+    if not pairs:
+        await update.message.reply_text(f"No near-duplicates in '{name}'.")
+        return
+    total = len(pairs)
+    lines = [f"🔎 Found {total} near-duplicate pairs in '{name}':\n"]
+    for i, row in enumerate(pairs[:NEARDUPES_PAIRS_PER_PAGE]):
+        v1_fid, v1_fuid, v1_dur, v1_size, v2_fid, v2_fuid, v2_dur, v2_size, dur_diff, size_diff, size_pct = row
+        lines.append(
+            f"Pair {i+1}: {v1_dur}s/{v1_size/1024/1024:.1f}MB vs {v2_dur}s/{v2_size/1024/1024:.1f}MB "
+            f"(diff: {dur_diff}s, {size_pct}% size)"
+        )
+    if total > NEARDUPES_PAIRS_PER_PAGE:
+        lines.append(f"\n...and {total - NEARDUPES_PAIRS_PER_PAGE} more.")
+    token = f"{update.effective_chat.id}:{name}"
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"📤 Compare all {total} pairs", callback_data=f"neardupes:{token}")],
+        [InlineKeyboardButton("🧹 Cleanup dead first", callback_data=f"neardupcleanup:{token}")]
+    ])
+    await update.message.reply_text("\n".join(lines), reply_markup=keyboard)
 
 async def neardupes_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (same as original)
-    pass
+    query = update.callback_query
+    token = query.data[len("neardupes:"):]
+    try:
+        _, name = token.split(":", 1)
+    except ValueError:
+        await query.answer("Invalid.")
+        return
+    chat_id = update.effective_chat.id
+    await query.answer()
+    await query.edit_message_text(f"📤 Sending pairs from '{name}'...")
+    try:
+        def _find(conn):
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT 
+                        v1.file_id, v1.file_unique_id, v1.duration, v1.file_size,
+                        v2.file_id, v2.file_unique_id, v2.duration, v2.file_size,
+                        ABS(v1.duration - v2.duration) as dur_diff,
+                        ABS(v1.file_size - v2.file_size) as size_diff,
+                        CASE 
+                            WHEN v1.file_size > 0 THEN ROUND(ABS(v1.file_size - v2.file_size)::numeric / v1.file_size * 100, 2)
+                            ELSE 0 
+                        END as size_pct
+                    FROM videos v1
+                    JOIN videos v2 ON v1.collection = v2.collection AND v1.file_unique_id < v2.file_unique_id
+                    WHERE v1.collection = %s
+                      AND v1.file_size IS NOT NULL AND v2.file_size IS NOT NULL
+                      AND (
+                          (v1.duration IS NOT NULL AND v2.duration IS NOT NULL
+                           AND ABS(v1.duration - v2.duration) <= 2
+                           AND v2.file_size BETWEEN v1.file_size * 0.98 AND v1.file_size * 1.02)
+                          OR
+                          ((v1.duration IS NULL OR v2.duration IS NULL)
+                           AND v2.file_size BETWEEN v1.file_size * 0.995 AND v1.file_size * 1.005)
+                      )
+                    ORDER BY size_pct DESC, dur_diff DESC
+                    """,
+                    (name,),
+                )
+                return cur.fetchall()
+        pairs = await db_run(_find)
+    except Exception:
+        await reply_db_error(update, "fetch pairs")
+        return
+    if not pairs:
+        await context.bot.send_message(chat_id, f"No pairs in '{name}' anymore.")
+        return
+    total = len(pairs)
+    sent = 0
+    failed = 0
+    for i, row in enumerate(pairs):
+        v1_fid, v1_fuid, v1_dur, v1_size, v2_fid, v2_fuid, v2_dur, v2_size, dur_diff, size_diff, size_pct = row
+        caption = (
+            f"🔎 Pair {i+1}/{total}\n"
+            f"Left: {v1_dur}s/{v1_size/1024/1024:.1f}MB\n"
+            f"Right: {v2_dur}s/{v2_size/1024/1024:.1f}MB\n"
+            f"Diff: {dur_diff}s, {size_pct}% size"
+        )
+        media = [InputMediaVideo(media=v1_fid, caption=caption), InputMediaVideo(media=v2_fid)]
+        try:
+            msgs = await context.bot.send_media_group(chat_id=chat_id, media=media)
+            sent += 2
+            def _record(conn):
+                with conn.cursor() as cur:
+                    cur.executemany(
+                        "INSERT INTO sent_videos (chat_id, message_id, collection, file_unique_id) VALUES (%s, %s, %s, %s) ON CONFLICT (chat_id, message_id) DO UPDATE SET collection=EXCLUDED.collection, file_unique_id=EXCLUDED.file_unique_id",
+                        [(chat_id, msg.message_id, name, fuid) for msg, fuid in zip(msgs, [v1_fuid, v2_fuid])],
+                    )
+            await db_run(_record)
+        except TelegramError:
+            for fid, fuid in [(v1_fid, v1_fuid), (v2_fid, v2_fuid)]:
+                msg = await _send_single_video_with_fallback(chat_id, fid, fuid, None, context, name)
+                if msg:
+                    sent += 1
+                else:
+                    failed += 1
+            await context.bot.send_message(chat_id, caption)
+        await asyncio.sleep(NEARDUP_ALBUM_DELAY)
+    if failed:
+        await context.bot.send_message(chat_id, f"✅ Sent {sent} videos, {failed} failed (dead). Use /cleanup {name}.")
+    else:
+        await context.bot.send_message(chat_id, f"✅ All {sent} videos sent.")
 
 async def neardupcleanup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (same as original)
-    pass
+    query = update.callback_query
+    token = query.data[len("neardupcleanup:"):]
+    try:
+        _, name = token.split(":", 1)
+    except ValueError:
+        await query.answer("Invalid.")
+        return
+    await query.answer()
+    await query.edit_message_text(f"🧹 Cleaning up dead files in '{name}'...")
+    try:
+        def _cleanup(conn):
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM videos WHERE collection = %s AND file_unique_id IN (SELECT file_unique_id FROM dead_files)",
+                    (name,),
+                )
+                removed = cur.rowcount
+                cur.execute("DELETE FROM dead_files d WHERE NOT EXISTS (SELECT 1 FROM videos v WHERE v.file_unique_id = d.file_unique_id)")
+                return removed
+        removed = await db_run(_cleanup)
+        await query.edit_message_text(f"🧹 Removed {removed} dead videos from '{name}'. Re-run /neardupes if needed.")
+    except Exception:
+        await query.edit_message_text("⚠️ Cleanup failed.")
 
 async def find_dups(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (same as original)
-    pass
+    if not context.args:
+        await update.message.reply_text("Usage: /dups <collection>")
+        return
+    name = normalize_name(" ".join(context.args))
+    try:
+        def _query(conn):
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT v1.file_unique_id, v1.duration, v1.file_size, ARRAY_AGG(DISTINCT v2.collection ORDER BY v2.collection)
+                    FROM videos v1
+                    JOIN videos v2 ON v1.file_unique_id = v2.file_unique_id AND v1.collection != v2.collection
+                    WHERE v1.collection = %s
+                    GROUP BY v1.file_unique_id, v1.duration, v1.file_size
+                    ORDER BY COUNT(DISTINCT v2.collection) DESC
+                    """,
+                    (name,),
+                )
+                return cur.fetchall()
+        rows = await db_run(_query)
+    except Exception:
+        await reply_db_error(update, "find dups")
+        return
+    if not rows:
+        await update.message.reply_text(f"No duplicates for '{name}'.")
+        return
+    lines = [f"🔍 {len(rows)} duplicate videos in '{name}':\n"]
+    for fuid, dur, size, others in rows[:20]:
+        lines.append(f"• {dur}s / {size/1024/1024:.1f}MB — also in: {', '.join(others)}")
+    if len(rows) > 20:
+        lines.append(f"...and {len(rows)-20} more.")
+    await update.message.reply_text("\n".join(lines))
 
 async def recent_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (same as original)
-    pass
+    if not context.args:
+        await update.message.reply_text("Usage: /recent <name> [n]")
+        return
+    args = list(context.args)
+    n = 10
+    if args and args[-1].isdigit():
+        n = max(1, min(50, int(args[-1])))
+        args = args[:-1]
+    if not args:
+        await update.message.reply_text("Missing collection name.")
+        return
+    name = normalize_name(" ".join(args))
+    try:
+        def _query(conn):
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT file_id, file_unique_id, duration, file_size, added_at, file_name FROM videos WHERE collection = %s ORDER BY added_at DESC LIMIT %s",
+                    (name, n),
+                )
+                return cur.fetchall()
+        rows = await db_run(_query)
+    except Exception:
+        await reply_db_error(update, "recent")
+        return
+    if not rows:
+        await update.message.reply_text(f"No videos in '{name}'.")
+        return
+    lines = [f"📅 Last {len(rows)} added to '{name}':\n"]
+    for i, (fid, fuid, dur, size, added, fname) in enumerate(rows, 1):
+        dur_str = f"{dur}s" if dur else "?s"
+        size_str = f"{size/1024/1024:.1f}MB" if size else "?MB"
+        date_str = added.strftime("%Y-%m-%d %H:%M") if added else "?"
+        fname_str = f" — {fname}" if fname else ""
+        lines.append(f"{i}. {dur_str} / {size_str}{fname_str} — {date_str}")
+    await update.message.reply_text("\n".join(lines))
 
 async def cleanup_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (same as original)
-    pass
+    if not context.args:
+        await update.message.reply_text("Usage: /cleanup <name>")
+        return
+    name = normalize_name(" ".join(context.args))
+    try:
+        def _query(conn):
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT v.file_unique_id, v.duration, v.file_size FROM videos v JOIN dead_files d ON v.file_unique_id = d.file_unique_id WHERE v.collection = %s",
+                    (name,),
+                )
+                return cur.fetchall()
+        dead = await db_run(_query)
+    except Exception:
+        await reply_db_error(update, "check dead")
+        return
+    if not dead:
+        await update.message.reply_text(f"✅ No dead files in '{name}'.")
+        return
+    lines = [f"🧹 Found {len(dead)} dead video(s) in '{name}':\n"]
+    for fuid, dur, size in dead[:10]:
+        lines.append(f"• {dur}s / {size/1024/1024:.1f}MB" if dur and size else "• unknown")
+    if len(dead) > 10:
+        lines.append(f"...and {len(dead)-10} more.")
+    token = f"{update.effective_chat.id}:{name}:cleanup"
+    _pending_deletes[token] = name
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Remove dead", callback_data=f"cleanupconfirm:{token}"),
+         InlineKeyboardButton("❌ Cancel", callback_data=f"cleanupcancel:{token}")]
+    ])
+    await update.message.reply_text("\n".join(lines) + "\nRemove them?", reply_markup=keyboard)
 
 async def cleanup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (same as original)
-    pass
+    query = update.callback_query
+    action, token = query.data.split(":", 1)
+    name = _pending_deletes.pop(token, None)
+    if name is None:
+        await query.answer("Expired.")
+        await query.edit_message_text("⏱️ Expired.")
+        return
+    if action == "cleanupcancel":
+        await query.answer("Cancelled.")
+        await query.edit_message_text(f"❎ Cancelled — '{name}' unchanged.")
+        return
+    await query.answer("Cleaning...")
+    try:
+        def _cleanup(conn):
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM videos WHERE collection = %s AND file_unique_id IN (SELECT file_unique_id FROM dead_files)",
+                    (name,),
+                )
+                removed = cur.rowcount
+                cur.execute("DELETE FROM dead_files d WHERE NOT EXISTS (SELECT 1 FROM videos v WHERE v.file_unique_id = d.file_unique_id)")
+                return removed
+        removed = await db_run(_cleanup)
+        await query.edit_message_text(f"🧹 Removed {removed} dead video(s) from '{name}'.")
+    except Exception:
+        await query.edit_message_text("⚠️ Cleanup failed.")
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (same as original)
-    pass
-
-async def find_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (same as original)
-    pass
+    try:
+        def _query(conn):
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM videos")
+                total = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(DISTINCT collection) FROM videos")
+                colls = cur.fetchone()[0]
+                cur.execute("SELECT collection, COUNT(*) FROM videos GROUP BY collection ORDER BY COUNT(*) DESC LIMIT 1")
+                largest = cur.fetchone()
+                cur.execute("SELECT collection, added_at FROM videos ORDER BY added_at ASC LIMIT 1")
+                oldest = cur.fetchone()
+                cur.execute("SELECT collection, added_at FROM videos ORDER BY added_at DESC LIMIT 1")
+                newest = cur.fetchone()
+                cur.execute("SELECT COUNT(*) FROM dead_files")
+                dead = cur.fetchone()[0]
+                return total, colls, largest, oldest, newest, dead
+        total, colls, largest, oldest, newest, dead = await db_run(_query)
+    except Exception:
+        await reply_db_error(update, "stats")
+        return
+    if total == 0:
+        await update.message.reply_text("📊 No videos yet.")
+        return
+    lines = [f"📊 Stats:\nTotal videos: {total}\nCollections: {colls}"]
+    if largest:
+        lines.append(f"Largest: '{largest[0]}' ({largest[1]})")
+    if oldest:
+        lines.append(f"Oldest: '{oldest[0]}' on {oldest[1].strftime('%Y-%m-%d')}")
+    if newest:
+        lines.append(f"Newest: '{newest[0]}' on {newest[1].strftime('%Y-%m-%d')}")
+    if dead:
+        lines.append(f"Dead files: {dead} (use /cleanup)")
+    await update.message.reply_text("\n".join(lines))
 
 def _parse_filter(s: str) -> Tuple[str, int]:
-    # ... (same as original)
-    pass
+    if s.startswith(">="):
+        return ">=", int(s[2:])
+    elif s.startswith("<="):
+        return "<=", int(s[2:])
+    elif s.startswith(">"):
+        return ">", int(s[1:])
+    elif s.startswith("<"):
+        return "<", int(s[1:])
+    elif s.startswith("="):
+        return "=", int(s[1:])
+    else:
+        raise ValueError("Invalid operator")
 
 # ----------------------------------------------------------------------
 # Error handler for DB errors
@@ -2271,15 +3155,15 @@ async def post_init(application: Application):
         BotCommand("stop", "Cancel and pause"),
         BotCommand("removemode", "Toggle delete mode"),
         BotCommand("random", "Send random video"),
-        BotCommand("search", "Search videos by filename"),  # NEW
+        BotCommand("search", "Search videos by filename"),
+        BotCommand("find", "Search videos with filters"),
         BotCommand("neardupes", "Find near-duplicates"),
         BotCommand("recent", "Show recent videos"),
-        BotCommand("setexpiry", "Auto-delete videos (admin)"),  # NEW
+        BotCommand("setexpiry", "Auto-delete videos (admin)"),
         BotCommand("rename", "Rename collection (admin)"),
         BotCommand("merge", "Merge collections (admin)"),
         BotCommand("copy", "Copy collection (admin)"),
         BotCommand("delete", "Delete collection (admin)"),
-        BotCommand("find", "Search videos"),
         BotCommand("stats", "Database stats"),
         BotCommand("backup", "Full DB backup (admin)"),
     ])
@@ -2335,8 +3219,8 @@ async def run():
     application.add_handler(CommandHandler("find", find_videos))
     application.add_handler(CommandHandler("stats", stats))
     application.add_handler(CommandHandler("backup", backup))
-    application.add_handler(CommandHandler("search", search_videos))  # NEW
-    application.add_handler(CommandHandler("setexpiry", set_expiry))  # NEW
+    application.add_handler(CommandHandler("search", search_videos))
+    application.add_handler(CommandHandler("setexpiry", set_expiry))
 
     # Callbacks
     application.add_handler(CallbackQueryHandler(delete_callback, pattern=r"^del(confirm|cancel):"))
@@ -2357,6 +3241,12 @@ async def run():
     application.add_handler(CallbackQueryHandler(menu_view_callback, pattern=r"^menuview:"))
     application.add_handler(CallbackQueryHandler(menu_random_callback, pattern=r"^menurandom:"))
     application.add_handler(CallbackQueryHandler(random_next_callback, pattern=r"^random_next:"))
+    
+    # NEW: Find command callbacks
+    application.add_handler(CallbackQueryHandler(find_page_callback, pattern=r"^findpage:"))
+    application.add_handler(CallbackQueryHandler(find_video_callback, pattern=r"^findvideo:"))
+    application.add_handler(CallbackQueryHandler(find_all_callback, pattern=r"^findall:"))
+    application.add_handler(CallbackQueryHandler(find_close_callback, pattern=r"^findclose:"))
 
     # Message handlers
     application.add_handler(MessageHandler(filters.VIDEO, handle_video))
