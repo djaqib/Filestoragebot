@@ -197,6 +197,32 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Starlette Webhook Server ---
 
+def init_db():
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS folders (
+                    id SERIAL PRIMARY KEY,
+                    name VARCHAR(255) NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    parent_id INT REFERENCES folders(id) ON DELETE CASCADE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS files (
+                    id SERIAL PRIMARY KEY,
+                    file_name VARCHAR(255) NOT NULL,
+                    telegram_file_id VARCHAR(255) NOT NULL,
+                    folder_id INT REFERENCES folders(id) ON DELETE CASCADE,
+                    user_id BIGINT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            conn.commit()
+    finally:
+        release_db(conn)
+
+
 ptb_app = Application.builder().token(TOKEN).build()
 
 ptb_app.add_handler(CommandHandler("start", start))
@@ -213,6 +239,7 @@ async def telegram_webhook(request):
 
 
 async def startup():
+    init_db()  # Automatically creates tables in Neon on boot
     await ptb_app.initialize()
     await ptb_app.start()
     webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
