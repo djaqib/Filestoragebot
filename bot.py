@@ -497,9 +497,11 @@ async def list_collections(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     top_folders = sorted(list({c.split("/")[0] for c in cols}))
-    keyboard = []
-    for f in top_folders:
-        keyboard.append([InlineKeyboardButton(f"📁 {f}", callback_data=f"listfolder:{f}")])
+    folder_buttons = [
+        InlineKeyboardButton(f"📁 {f}", callback_data=f"listfolder:{f}")
+        for f in top_folders
+    ]
+    keyboard = [folder_buttons[i:i + 2] for i in range(0, len(folder_buttons), 2)]
 
     await update.message.reply_text(
         "📁 *Collections Hierarchy*\nSelect a folder to inspect:",
@@ -1191,6 +1193,11 @@ async def confirm_delete_callback(update: Update, context: ContextTypes.DEFAULT_
         return
 
     await query.edit_message_text(f"✅ Deleted folder `{name}` ({count} items deleted).")
+
+async def cancel_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("❎ Deletion cancelled.")
 
 
 async def rename_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
