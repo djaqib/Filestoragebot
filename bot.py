@@ -1,2044 +1,510 @@
-import asyncio
-import io
-import json
-import logging
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Complete bot.py with improved pagination and Postgres-backed file_id fetching.
+
+Features:
+- Persistent navigation message with inline keyboard
+- Auto-send albums (media_group) on Prev/Next
+- Jump-to-page via /goto and inline Jump prompt
+- Prefetch next pages into in-memory cache
+- Uses Telegram file_id values stored in Postgres (no re-upload)
+- Minimal in-memory state; recommended to replace with Redis for production
+
+Before running:
+- Install dependencies: pip install python-telegram-bot==13.XX psycopg2-binary
+- Set environment variables:
+    BOT_TOKEN or replace TOKEN below
+    DATABASE_URL (preferred) or PGHOST, PGPORT, PGUSER, PGPASSWORD, PGDATABASE
+- Backup your original bot.py before replacing.
+"""
+
 import os
+import logging
+import asyncio
+import math
 import re
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, Any, List, Tuple
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from starlette.applications import Starlette
-from starlette.responses import PlainTextResponse, Response
-from starlette.routing import Route
-import uvicorn
 
 from telegram import (
-    BotCommand,
+    Bot,
+    Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaVideo,
-    Message,
-    Update,
 )
-from telegram.error import TelegramError
 from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
+    Updater,
     CommandHandler,
-    ContextTypes,
+    CallbackQueryHandler,
     MessageHandler,
-    TypeHandler,
-    filters,
+    Filters,
+    CallbackContext,
 )
 
-# ----------------------------------------------------------------------
-# Logging & Environment Setup
-# ----------------------------------------------------------------------
+# -----------------------
+# Configuration
+# -----------------------
+TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+PAGE_SIZE = 10  # Telegram media_group max is 10
+PREFETCH_COUNT = 2
+SEND_DELAY_SECONDS = 1.0
+PREFETCH_DELAY_SECONDS = 0.2
+TESTING = False
+
+# -----------------------
+# Logging
+# -----------------------
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "default_secret")
-PORT = int(os.getenv("PORT", "8080"))
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
+# -----------------------
+# In-memory pagination state
+# -----------------------
+# Key: (chat_id, folder_id) -> value: dict with keys:
+#   page: int
+#   page_size: int
+#   total: int
+#   message_id: int
+#   cache: {page: [file_id, ...]}
+#   awaiting_jump: bool
+PAGINATION_STATE: Dict[Tuple[int, str], Dict[str, Any]] = {}
 
-if not BOT_TOKEN or not DATABASE_URL or not RENDER_EXTERNAL_URL:
-    logger.error("Missing required environment variables.")
 
-# Constants
-DEFAULT_COLLECTION = "default"
-GET_BATCH_SIZE = 10
-GET_PAGINATION_LIMIT = 5
-GET_PAGE_TIMEOUT = 120
-NEARDUPES_PAIRS_PER_PAGE = 5
-NEARDUP_ALBUM_DELAY = 1.0
-SAVE_SUMMARY_DEBOUNCE_SECONDS = 2.5
+# -----------------------
+# Helper functions
+# -----------------------
+def get_state(chat_id: int, folder_id: str) -> Dict[str, Any]:
+    key = (chat_id, folder_id)
+    if key not in PAGINATION_STATE:
+        PAGINATION_STATE[key] = {
+            "page": 1,
+            "page_size": PAGE_SIZE,
+            "total": 0,
+            "message_id": None,
+            "cache": {},
+            "awaiting_jump": False,
+        }
+    return PAGINATION_STATE[key]
 
-NEAR_DUP_DURATION_TOLERANCE_SECONDS = 2
-NEAR_DUP_SIZE_TOLERANCE_FRACTION = 0.05
-NEAR_DUP_SIZE_ONLY_TOLERANCE_FRACTION = 0.02
 
-# State Management
-active_collections: Dict[int, List[str]] = {}
-paused_chats: Set[int] = set()
-removing_chats: Set[int] = set()
-min_video_length: Dict[int, int] = {}
-_active_tasks: Dict[int, asyncio.Task] = {}
-_get_sessions: Dict[int, Tuple[List[str], str, int, Message]] = {}
-_save_counts: Dict[int, Dict] = {}
-_save_notify_tasks: Dict[int, asyncio.Task] = {}
+def compute_total_pages(total_items: int, page_size: int) -> int:
+    if page_size <= 0:
+        return 1
+    return max(1, math.ceil(total_items / page_size))
 
-# ----------------------------------------------------------------------
-# Path & Validation Utilities
-# ----------------------------------------------------------------------
-def normalize_name(name: str) -> str:
-    cleaned = name.strip().lower()
-    cleaned = re.sub(r"[^\w\s/-]", "", cleaned)
-    parts = [p.strip() for p in cleaned.split("/") if p.strip()]
-    return "/".join(parts) if parts else DEFAULT_COLLECTION
 
-def validate_collection_path(name: str) -> Optional[str]:
-    if not name:
-        return "empty"
-    parts = name.split("/")
-    if len(parts) > 5:
-        return "too_deep"
-    for p in parts:
-        if not p or len(p) > 30:
-            return "invalid_segment"
-    return None
-
-def describe_path_error(err_code: str) -> str:
-    if err_code == "too_deep":
-        return "Folder depth max level is 5."
-    if err_code == "invalid_segment":
-        return "Folder names must be 1-30 characters long."
-    return "Invalid path format."
-
-def get_active_collections(chat_id: int) -> List[str]:
-    return active_collections.get(chat_id, [DEFAULT_COLLECTION])
-
-def _under_clause(name: str) -> Tuple[str, Tuple[str, str]]:
-    """SQL fragment + params matching a collection or anything nested under it
-    (e.g. 'movies' also matches 'movies/action'). Always use this instead of
-    hand-writing a 'collection LIKE ... /%' clause: building the '/%' pattern
-    directly into the SQL text is what caused the repeated escaping bug,
-    since psycopg2 scans the whole query string for '%'. Passing the pattern
-    as a bound parameter instead avoids that entirely.
-    Usage: clause, params = _under_clause(name); cur.execute(f"... WHERE {clause}", params)
-    """
-    return "(collection = %s OR collection LIKE %s)", (name, f"{name}/%")
-
-def _is_video_document(msg: Message) -> bool:
-    if not msg.document:
-        return False
-    mime = msg.document.mime_type or ""
-    name = msg.document.file_name or ""
-    return mime.startswith("video/") or name.lower().endswith(
-        (".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".wmv", ".m4v")
-    )
-
-def _parse_arrow_pair(args: List[str]) -> Optional[Tuple[str, str]]:
-    text = " ".join(args).strip()
-    if "->" in text:
-        parts = text.split("->", 1)
-        src = normalize_name(parts[0])
-        dest = normalize_name(parts[1])
-        if src and dest:
-            return src, dest
-    return None
-
-# ----------------------------------------------------------------------
-# Database Operations
-# ----------------------------------------------------------------------
-def get_db_connection():
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
-
-def _db_call(fn):
-    conn = get_db_connection()
-    try:
-        res = fn(conn)
-        conn.commit()
-        return res
-    except Exception as e:
-        conn.rollback()
-        raise e
-    finally:
-        conn.close()
-
-async def db_run(fn):
-    return await asyncio.to_thread(_db_call, fn)
-
-def init_db():
-    def _schema(conn):
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS videos (
-                    id SERIAL PRIMARY KEY,
-                    collection TEXT NOT NULL,
-                    file_id TEXT NOT NULL,
-                    file_unique_id TEXT NOT NULL,
-                    duration INTEGER,
-                    file_size BIGINT,
-                    file_name TEXT,
-                    added_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(collection, file_unique_id)
-                );
-                CREATE INDEX IF NOT EXISTS idx_videos_col ON videos(collection);
-                CREATE INDEX IF NOT EXISTS idx_videos_fuid ON videos(file_unique_id);
-
-                CREATE TABLE IF NOT EXISTS sent_videos (
-                    chat_id BIGINT NOT NULL,
-                    collection TEXT NOT NULL,
-                    file_unique_id TEXT NOT NULL,
-                    sent_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY(chat_id, collection, file_unique_id)
-                );
-
-                CREATE TABLE IF NOT EXISTS dead_files (
-                    file_unique_id TEXT PRIMARY KEY,
-                    detected_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-                );
-
-                CREATE TABLE IF NOT EXISTS collection_settings (
-                    collection TEXT PRIMARY KEY,
-                    expiry_days INTEGER DEFAULT 0
-                );
-                """
-            )
-    _db_call(_schema)
-    logger.info("Database schema initialized.")
-
-# ----------------------------------------------------------------------
-# Access Control
-# ----------------------------------------------------------------------
-async def access_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if ADMIN_USER_ID and update.effective_user:
-        if update.effective_user.id != ADMIN_USER_ID:
-            if update.effective_message:
-                await update.effective_message.reply_text("⛔ Unauthorized access.")
-            elif update.callback_query:
-                await update.callback_query.answer("⛔ Unauthorized.", show_alert=True)
-            return False
-    return True
-
-async def admin_check(update: Update) -> bool:
-    if ADMIN_USER_ID and update.effective_user and update.effective_user.id != ADMIN_USER_ID:
-        if update.effective_message:
-            await update.effective_message.reply_text("⛔ Admin rights required.")
-        return False
-    return True
-
-# ----------------------------------------------------------------------
-# Video Ingestion & Handling
-# ----------------------------------------------------------------------
-async def _save_video_to_db(collection: str, file_id: str, file_unique_id: str, duration: Optional[int], file_size: Optional[int], file_name: Optional[str]) -> bool:
-    def _insert(conn):
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO videos (collection, file_id, file_unique_id, duration, file_size, file_name)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (collection, file_unique_id) DO NOTHING
-                """,
-                (collection, file_id, file_unique_id, duration, file_size, file_name),
-            )
-            return cur.rowcount > 0
-    return await db_run(_insert)
-
-async def _delete_video_from_collection(collection: str, file_unique_id: str) -> bool:
-    def _delete(conn):
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM videos WHERE collection = %s AND file_unique_id = %s", (collection, file_unique_id))
-            return cur.rowcount > 0
-    return await db_run(_delete)
-
-async def _flush_save_summary(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await asyncio.sleep(SAVE_SUMMARY_DEBOUNCE_SECONDS)
-    except asyncio.CancelledError:
-        return
-    stats = _save_counts.pop(chat_id, None)
-    _save_notify_tasks.pop(chat_id, None)
-    if not stats:
-        return
-
-    parts = []
-    if stats["saved"]:
-        parts.append(f"✅ Saved {stats['saved']} video(s)")
-    if stats["removed"]:
-        parts.append(f"🗑️ Removed {stats['removed']} video(s)")
-    if stats["skipped"]:
-        parts.append(f"↩️ Skipped {stats['skipped']} duplicate(s)")
-    if not parts:
-        return
-
-    cols = ", ".join(f"`{c}`" for c in sorted(stats["cols"]))
-    text = " · ".join(parts) + (f" — {cols}" if cols else "")
-    try:
-        await context.bot.send_message(chat_id, text, parse_mode="Markdown")
-    except TelegramError:
-        pass
-
-def _record_activity(chat_id: int, collection: str, kind: str, context: ContextTypes.DEFAULT_TYPE):
-    stats = _save_counts.setdefault(chat_id, {"saved": 0, "skipped": 0, "removed": 0, "cols": set()})
-    stats[kind] += 1
-    stats["cols"].add(collection)
-
-    existing = _save_notify_tasks.get(chat_id)
-    if existing and not existing.done():
-        existing.cancel()
-    _save_notify_tasks[chat_id] = asyncio.create_task(_flush_save_summary(chat_id, context))
-
-async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if chat_id in paused_chats:
-        return
-
-    video = update.message.video
-    if not video:
-        return
-
-    min_len = min_video_length.get(chat_id)
-    if min_len is not None and video.duration is not None and video.duration < min_len:
-        return
-
-    collections = get_active_collections(chat_id)
-    is_remove = chat_id in removing_chats
-
-    for col in collections:
-        if is_remove:
-            removed = await _delete_video_from_collection(col, video.file_unique_id)
-            _record_activity(chat_id, col, "removed" if removed else "skipped", context)
-        else:
-            saved = await _save_video_to_db(col, video.file_id, video.file_unique_id, video.duration, video.file_size, getattr(video, "file_name", None))
-            _record_activity(chat_id, col, "saved" if saved else "skipped", context)
-
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if chat_id in paused_chats:
-        return
-
-    msg = update.message
-    if not _is_video_document(msg):
-        return
-
-    doc = msg.document
-    collections = get_active_collections(chat_id)
-    is_remove = chat_id in removing_chats
-
-    for col in collections:
-        if is_remove:
-            removed = await _delete_video_from_collection(col, doc.file_unique_id)
-            _record_activity(chat_id, col, "removed" if removed else "skipped", context)
-        else:
-            saved = await _save_video_to_db(col, doc.file_id, doc.file_unique_id, None, doc.file_size, doc.file_name)
-            _record_activity(chat_id, col, "saved" if saved else "skipped", context)
-
-async def handle_non_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pass
-
-# ----------------------------------------------------------------------
-# Helper Video Sending Routines
-# ----------------------------------------------------------------------
-async def _send_single_video_with_fallback(chat_id: int, file_id: str, file_unique_id: str, caption: str, context: ContextTypes.DEFAULT_TYPE, collection: str) -> Optional[Message]:
-    try:
-        return await context.bot.send_video(chat_id=chat_id, video=file_id, caption=caption)
-    except TelegramError as e:
-        err_str = str(e).lower()
-        if "wrong remote file identifier" in err_str or "file reference" in err_str or "not found" in err_str:
-            def _mark_dead(conn):
-                with conn.cursor() as cur:
-                    cur.execute("INSERT INTO dead_files (file_unique_id) VALUES (%s) ON CONFLICT DO NOTHING", (file_unique_id,))
-            await db_run(_mark_dead)
-        return None
-
-# ----------------------------------------------------------------------
-# Navigation & Commands
-# ----------------------------------------------------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Welcome to Video Collector Bot!\n\n"
-        "Forward videos here to automatically save them to your active collection.\n"
-        "Use /menu to browse collections or /help to view all available commands."
-    )
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = (
-        "📚 *Bot Commands Reference*\n\n"
-        "📌 *Basic Commands*\n"
-        "• /menu - Interactive collection menu\n"
-        "• /collect <name> - Set active collection\n"
-        "• /fav - Quick access to 'favorites'\n"
-        "• /current - View active collection\n"
-        "• /finish - Reset to default collection\n"
-        "• /stop - Stop tasks and pause saving\n\n"
-        "📦 *Collection Operations*\n"
-        "• /get [name] - Retrieve videos\n"
-        "• /list - Browse all collections\n"
-        "• /random [name] - Send random video\n"
-        "• /status - Show active collection stats\n"
-        "• /info <name> - Detailed storage info\n"
-        "• /delete <name> - Delete collection\n"
-        "• /rename <old> -> <new> - Rename collection\n"
-        "• /move <src> -> <dest> - Move videos\n"
-        "• /copy <src> -> <dest> - Copy videos\n"
-        "• /merge <src> -> <dest> - Merge collections\n\n"
-        "🔍 *Search & Utilities*\n"
-        "• /search <query> - Search by filename\n"
-        "• /find - Find by size/duration\n"
-        "• /dups <name> - Find exact duplicates\n"
-        "• /neardupes <name> - Visual near-duplicate cleanup\n"
-        "• /removemode on|off - Toggle auto-delete mode\n"
-        "• /minlength <sec> - Filter short videos"
-    )
-    await update.message.reply_text(help_text, parse_mode="Markdown")
-
-async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _show_main_menu(update.effective_chat.id, context, edit_message=None)
-
-async def _show_main_menu(chat_id: int, context: ContextTypes.DEFAULT_TYPE, edit_message: Optional[Message] = None):
-    try:
-        def _get_folders(conn):
-            with conn.cursor() as cur:
-                cur.execute("SELECT DISTINCT collection FROM videos")
-                rows = cur.fetchall()
-                cols = [r[0] for r in rows]
-                top_folders = set()
-                for c in cols:
-                    top_folders.add(c.split("/")[0])
-                return sorted(list(top_folders))
-        folders = await db_run(_get_folders)
-    except Exception as e:
-        logger.exception("Error loading main menu")
-        folders = []
-
-    folder_buttons = [InlineKeyboardButton(f"📁 {f}", callback_data=f"menufolder:{f}") for f in folders]
-    keyboard = [folder_buttons[i:i + 2] for i in range(0, len(folder_buttons), 2)]
-    keyboard.append([InlineKeyboardButton("⚙️ Settings", callback_data="menu_settings")])
-
-    text = "📁 *Main Menu*\nSelect a folder to browse:"
-    if edit_message:
-        await edit_message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-    else:
-        await context.bot.send_message(chat_id, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-
-async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-
-    if data == "menu_settings":
-        await settings_command(update, context)
-
-async def menu_folder_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    folder_prefix = query.data[len("menufolder:"):]
-
-    try:
-        def _get_sub_items(conn):
-            with conn.cursor() as cur:
-                clause, params = _under_clause(folder_prefix)
-                cur.execute(
-                    f"SELECT DISTINCT collection FROM videos WHERE {clause}",
-                    params,
-                )
-                cols = [r[0] for r in cur.fetchall()]
-                subfolders = set()
-                exact_match = False
-                for c in cols:
-                    if c == folder_prefix:
-                        exact_match = True
-                    else:
-                        rel = c[len(folder_prefix) + 1:]
-                        subfolders.add(rel.split("/")[0])
-                return sorted(list(subfolders)), exact_match
-        subfolders, exact_match = await db_run(_get_sub_items)
-    except Exception as e:
-        await reply_db_error(update, f"fetch items for '{folder_prefix}'", e)
-        return
-
-    keyboard = []
-    if exact_match:
-        keyboard.append([InlineKeyboardButton("📄 View exact collection", callback_data=f"menuview:{folder_prefix}")])
-
-    for sf in subfolders:
-        full_path = f"{folder_prefix}/{sf}"
-        keyboard.append([InlineKeyboardButton(f"📁 {sf}", callback_data=f"menufolder:{full_path}")])
-
-    keyboard.append([
-        InlineKeyboardButton("📂 Set Active", callback_data=f"menuset:{folder_prefix}"),
-        InlineKeyboardButton("📩 Get All", callback_data=f"menugetall:{folder_prefix}"),
-    ])
-    keyboard.append([
-        InlineKeyboardButton("🎲 Random All", callback_data=f"menurandall:{folder_prefix}"),
-        InlineKeyboardButton("🗑️ Delete", callback_data=f"listdelete:{folder_prefix}"),
-    ])
-    keyboard.append([InlineKeyboardButton("⬅️ Back to Menu", callback_data="menu_back")])
-
-    await query.edit_message_text(
-        f"📁 Folder: `{folder_prefix}`",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown",
-    )
-
-async def menu_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    name = query.data[len("menuview:"):]
-
-    keyboard = InlineKeyboardMarkup([
+def build_nav_keyboard(folder_id: str, page: int, total_pages: int) -> InlineKeyboardMarkup:
+    kb = []
+    kb.append(
         [
-            InlineKeyboardButton("📂 Set Active", callback_data=f"menuset:{name}"),
-            InlineKeyboardButton("🎲 Random Video", callback_data=f"menurandom:{name}"),
-        ],
-        [
-            InlineKeyboardButton("🗑️ Delete Folder/Collection", callback_data=f"listdelete:{name}"),
-        ],
-        [
-            InlineKeyboardButton("⬅️ Back to menu", callback_data="menu_back"),
-        ],
-    ])
-
-    await query.edit_message_text(
-        f"📁 Collection: `{name}`\nSelect an action:",
-        reply_markup=keyboard,
-        parse_mode="Markdown",
-    )
-
-async def menu_get_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    name = query.data[len("menugetall:"):]
-    await query.edit_message_text(f"Fetching videos from `{name}`...", parse_mode="Markdown")
-    context.args = [name]
-    await get_collection(update, context)
-
-async def menu_rand_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    name = query.data[len("menurandall:"):]
-    context.args = [name]
-    await random_video(update, context)
-
-async def menu_set_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    name = query.data[len("menuset:"):]
-    chat_id = update.effective_chat.id
-    active_collections[chat_id] = [name]
-    await query.edit_message_text(f"✅ Active collection set to `{name}`", parse_mode="Markdown")
-
-async def menu_random_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    name = query.data[len("menurandom:"):]
-    context.args = [name]
-    await random_video(update, context)
-
-async def menu_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await _show_main_menu(update.effective_chat.id, context, edit_message=query.message)
-
-# ----------------------------------------------------------------------
-# List Collections & UI Navigation
-# ----------------------------------------------------------------------
-async def list_collections(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        def _fetch(conn):
-            with conn.cursor() as cur:
-                cur.execute("SELECT DISTINCT collection FROM videos ORDER BY collection")
-                return [r[0] for r in cur.fetchall()]
-        cols = await db_run(_fetch)
-    except Exception as e:
-        await reply_db_error(update, "list collections", e)
-        return
-
-    if not cols:
-        await update.message.reply_text("No collections found.")
-        return
-
-    top_folders = sorted(list({c.split("/")[0] for c in cols}))
-    folder_buttons = [
-        InlineKeyboardButton(f"📁 {f}", callback_data=f"listfolder:{f}")
-        for f in top_folders
-    ]
-    keyboard = [folder_buttons[i:i + 2] for i in range(0, len(folder_buttons), 2)]
-
-    await update.message.reply_text(
-        "📁 *Collections Hierarchy*\nSelect a folder to inspect:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown",
-    )
-
-async def list_folder_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    folder = query.data[len("listfolder:"):]
-
-    try:
-        def _fetch_sub(conn):
-            with conn.cursor() as cur:
-                clause, params = _under_clause(folder)
-                cur.execute(
-                    f"SELECT DISTINCT collection FROM videos WHERE {clause}",
-                    params,
-                )
-                all_cols = [r[0] for r in cur.fetchall()]
-                subitems = set()
-                exact = False
-                for c in all_cols:
-                    if c == folder:
-                        exact = True
-                    else:
-                        sub = c[len(folder) + 1:].split("/")[0]
-                        subitems.add(f"{folder}/{sub}")
-                return sorted(list(subitems)), exact
-        subs, exact = await db_run(_fetch_sub)
-    except Exception as e:
-        await reply_db_error(update, "expand folder", e)
-        return
-
-    keyboard = []
-    if exact:
-        keyboard.append([InlineKeyboardButton("📄 View Action Menu", callback_data=f"listchoice:{folder}")])
-
-    # Build folder buttons
-    folder_buttons = [
-        InlineKeyboardButton(f"📁 {s}", callback_data=f"listfolder:{s}")
-        for s in subs
-    ]
-    
-    # Grid layout: group subfolders into rows of 2 buttons each
-    for i in range(0, len(folder_buttons), 2):
-        keyboard.append(folder_buttons[i:i + 2])
-
-    # Action buttons
-    keyboard.append([
-        InlineKeyboardButton("📂 Set Active", callback_data=f"listset:{folder}"),
-        InlineKeyboardButton("📩 Get Videos", callback_data=f"listget:{folder}"),
-    ])
-    keyboard.append([
-        InlineKeyboardButton("🎲 Random", callback_data=f"listrandom:{folder}"),
-        InlineKeyboardButton("🗑️ Delete", callback_data=f"listdelete:{folder}"),
-    ])
-    keyboard.append([InlineKeyboardButton("⬅️ Back to Menu", callback_data="menu_back")])
-
-    await query.edit_message_text(
-        f"📁 Location: `{folder}`",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown",
-    )
-
-
-
-
-async def list_choice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    name = query.data[len("listchoice:"):]
-
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📂 Set Active", callback_data=f"listset:{name}"),
-            InlineKeyboardButton("📩 Get Videos", callback_data=f"listget:{name}"),
-            InlineKeyboardButton("🎲 Random", callback_data=f"listrandom:{name}"),
-        ],
-        [
-            InlineKeyboardButton("🗑️ Delete Collection", callback_data=f"listdelete:{name}"),
-        ],
-        [
-            InlineKeyboardButton("⬅️ Back to menu", callback_data="menu_back"),
-        ],
-    ])
-
-    await query.edit_message_text(
-        f"'{name}' — what would you like to do?",
-        reply_markup=keyboard,
-    )
-
-async def list_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    name = query.data[len("listdelete:"):]
-
-    try:
-        def _count(conn):
-            with conn.cursor() as cur:
-                clause, params = _under_clause(name)
-                cur.execute(
-                    f"SELECT COUNT(*) FROM videos WHERE {clause}",
-                    params,
-                )
-                return cur.fetchone()[0]
-
-        total = await db_run(_count)
-    except Exception as e:
-        await reply_db_error(update, f"check '{name}'", e)
-        return
-
-    keyboard = [
-        [
-            InlineKeyboardButton("❌ Yes, Delete", callback_data=f"confirmdelete:{name}"),
-            InlineKeyboardButton("⬅️ Cancel", callback_data=f"listfolder:{name}"),
+            InlineKeyboardButton("Prev", callback_data=f"nav:{folder_id}:prev"),
+            InlineKeyboardButton(f"Page {page}/{total_pages}", callback_data="noop"),
+            InlineKeyboardButton("Next", callback_data=f"nav:{folder_id}:next"),
         ]
-    ]
-
-    await query.edit_message_text(
-        f"⚠️ Are you sure you want to delete **{name}**?\n"
-        f"This will delete **{total}** item(s).",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown",
     )
-
-
-async def list_set_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    name = query.data[len("listset:"):]
-    chat_id = update.effective_chat.id
-    active_collections[chat_id] = [name]
-    await query.edit_message_text(f"✅ Active collection set to `{name}`.", parse_mode="Markdown")
-
-async def list_get_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    name = query.data[len("listget:"):]
-    context.args = [name]
-    await get_collection(update, context)
-
-async def list_random_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    name = query.data[len("listrandom:"):]
-    context.args = [name]
-    await random_video(update, context)
-
-async def list_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pass
-
-# ----------------------------------------------------------------------
-# Retrieving Videos (Get / Pagination / Random / Search / Find)
-# ----------------------------------------------------------------------
-async def get_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    name = normalize_name(" ".join(context.args)) if context.args else get_active_collections(chat_id)[0]
-
-    try:
-        def _fetch(conn):
-            with conn.cursor() as cur:
-                clause, params = _under_clause(name)
-                cur.execute(f"SELECT file_id, file_unique_id FROM videos WHERE {clause} ORDER BY added_at", params)
-                return cur.fetchall()
-        rows = await db_run(_fetch)
-    except Exception as e:
-        await reply_db_error(update, f"get '{name}'", e)
-        return
-
-    if not rows:
-        msg = f"No videos found in `{name}`."
-        if update.callback_query:
-            await update.callback_query.edit_message_text(msg, parse_mode="Markdown")
-        else:
-            await update.message.reply_text(msg, parse_mode="Markdown")
-        return
-
-    file_ids = [r[0] for r in rows]
-    total = len(file_ids)
-    pages = (total + GET_BATCH_SIZE - 1) // GET_BATCH_SIZE
-
-    session_msg = await context.bot.send_message(
-        chat_id,
-        f"📦 Preparing to send {total} video(s) from `{name}` in pages...",
-        parse_mode="Markdown",
-    )
-
-    _get_sessions[chat_id] = (file_ids, name, 1, session_msg)
-    await _render_get_page(chat_id, context)
-
-async def _render_get_page(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    session = _get_sessions.get(chat_id)
-    if not session:
-        return
-
-    file_ids, name, page, msg = session
-    total = len(file_ids)
-    total_pages = (total + GET_BATCH_SIZE - 1) // GET_BATCH_SIZE
-    page = min(max(1, page), total_pages)
-
-    start_idx = (page - 1) * GET_BATCH_SIZE
-    end_idx = min(start_idx + GET_BATCH_SIZE, total)
-
-    text = f"📦 *Collection:* `{name}`\nPage {page}/{total_pages} (Videos {start_idx+1}-{end_idx} of {total})"
-    keyboard = [
+    kb.append(
         [
-            InlineKeyboardButton("◀️ Prev", callback_data=f"getpage:{page-1}"),
-            InlineKeyboardButton(f"Send Page ({end_idx-start_idx})", callback_data=f"getsend:{page}"),
-            InlineKeyboardButton("Next ▶️", callback_data=f"getpage:{page+1}"),
-        ],
-        [InlineKeyboardButton("🛑 Cancel", callback_data="getcancel")],
-    ]
-
-    try:
-        await msg.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-    except TelegramError:
-        pass
-
-async def get_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    chat_id = update.effective_chat.id
-    target_page = int(query.data.split(":")[1])
-
-    session = _get_sessions.get(chat_id)
-    if session:
-        file_ids, name, _, msg = session
-        _get_sessions[chat_id] = (file_ids, name, target_page, msg)
-        await _render_get_page(chat_id, context)
-
-async def get_send_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    chat_id = update.effective_chat.id
-
-    session = _get_sessions.get(chat_id)
-    if not session:
-        await query.edit_message_text("Session expired.")
-        return
-
-    file_ids, name, page, msg = session
-    start_idx = (page - 1) * GET_BATCH_SIZE
-    end_idx = min(start_idx + GET_BATCH_SIZE, len(file_ids))
-    batch = file_ids[start_idx:end_idx]
-
-    await query.edit_message_text(f"🚀 Sending page {page} ({len(batch)} videos)...")
-
-    for fid in batch:
-        try:
-            await context.bot.send_video(chat_id, fid)
-            await asyncio.sleep(0.5)
-        except TelegramError:
-            pass
-
-    _get_sessions.pop(chat_id, None)
-
-async def get_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    chat_id = update.effective_chat.id
-    _get_sessions.pop(chat_id, None)
-    await query.edit_message_text("Cancelled retrieval.")
-
-async def get_by_size(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pass
-
-async def random_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    name = normalize_name(" ".join(context.args)) if context.args else get_active_collections(chat_id)[0]
-
-    try:
-        def _fetch_rand(conn):
-            with conn.cursor() as cur:
-                clause, params = _under_clause(name)
-                cur.execute(
-                    f"SELECT file_id, file_unique_id FROM videos WHERE {clause} ORDER BY RANDOM() LIMIT 1",
-                    params,
-                )
-                return cur.fetchone()
-        res = await db_run(_fetch_rand)
-    except Exception as e:
-        await reply_db_error(update, "fetch random video", e)
-        return
-
-    if not res:
-        await update.message.reply_text(f"No videos found in `{name}`.", parse_mode="Markdown")
-        return
-
-    fid, fuid = res
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🎲 Another Random", callback_data=f"random_next:{name}")]])
-    await context.bot.send_video(chat_id, fid, caption=f"🎲 Random from `{name}`", reply_markup=kb, parse_mode="Markdown")
-
-async def random_next_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    name = query.data[len("random_next:"):]
-    context.args = [name]
-    await random_video(update, context)
-
-async def random_next_recursive_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pass
-
-async def search_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /search <query>")
-        return
-    query_str = " ".join(context.args)
-
-    try:
-        def _search(conn):
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT collection, file_id, file_name FROM videos WHERE file_name ILIKE %s LIMIT 20",
-                    (f"%{query_str}%",),
-                )
-                return cur.fetchall()
-        rows = await db_run(_search)
-    except Exception as e:
-        await reply_db_error(update, "search videos", e)
-        return
-
-    if not rows:
-        await update.message.reply_text(f"No videos matching '{query_str}'.")
-        return
-
-    lines = [f"🔍 *Search results for:* `{query_str}`"]
-    for col, fid, fname in rows:
-        lines.append(f"• `{col}`: {fname or 'Unnamed'}")
-
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-async def find_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Usage: Use /search <query> or specify parameters.")
-
-async def find_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pass
-
-async def find_video_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pass
-
-async def find_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pass
-
-async def find_close_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pass
-
-async def retry_failed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔄 Retrying failed sends...")
-
-# ----------------------------------------------------------------------
-# Settings & State Switchers
-# ----------------------------------------------------------------------
-async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    collections = get_active_collections(chat_id)
-    rem = "ON" if chat_id in removing_chats else "OFF"
-    paused = "YES" if chat_id in paused_chats else "NO"
-    min_l = min_video_length.get(chat_id, "OFF")
-
-    text = (
-        f"⚙️ *Settings*\n\n"
-        f"• Active Collection: `{', '.join(collections)}`\n"
-        f"• Remove Mode: {rem}\n"
-        f"• Paused: {paused}\n"
-        f"• Min Length Filter: {min_l}\n"
+            InlineKeyboardButton(f"Send Page ({PAGE_SIZE})", callback_data=f"send:{folder_id}:page:{page}"),
+            InlineKeyboardButton("Jump", callback_data=f"jump:{folder_id}"),
+            InlineKeyboardButton("Cancel", callback_data=f"cancel:{folder_id}"),
+        ]
     )
+    return InlineKeyboardMarkup(kb)
 
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Toggle Remove Mode", callback_data="settings:toggle_remove")],
-        [InlineKeyboardButton("Toggle Pause", callback_data="settings:toggle_pause")],
-        [InlineKeyboardButton("⬅️ Back to Menu", callback_data="menu_back")],
-    ])
 
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=kb, parse_mode="Markdown")
-    else:
-        await update.message.reply_text(text, reply_markup=kb, parse_mode="Markdown")
-
-async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    action = query.data.split(":")[1]
-    chat_id = update.effective_chat.id
-
-    if action == "toggle_remove":
-        if chat_id in removing_chats:
-            removing_chats.discard(chat_id)
+# -----------------------
+# Database / storage access
+# -----------------------
+def fetch_total_items_for_folder(folder_id: str) -> int:
+    """
+    Fetch total count of items for a folder from Postgres.
+    Adjust table/column names if your schema differs.
+    """
+    database_url = os.environ.get("DATABASE_URL")
+    conn = None
+    try:
+        if database_url:
+            conn = psycopg2.connect(database_url, cursor_factory=RealDictCursor)
         else:
-            removing_chats.add(chat_id)
-    elif action == "toggle_pause":
-        if chat_id in paused_chats:
-            paused_chats.discard(chat_id)
-        else:
-            paused_chats.add(chat_id)
-
-    await settings_command(update, context)
-
-async def collect(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if not context.args:
-        cols = get_active_collections(chat_id)
-        await update.message.reply_text(f"📁 Active collection: `{', '.join(cols)}`", parse_mode="Markdown")
-        return
-
-    name = normalize_name(" ".join(context.args))
-    err = validate_collection_path(name)
-    if err:
-        await update.message.reply_text(f"⚠️ {describe_path_error(err)}")
-        return
-
-    active_collections[chat_id] = [name]
-    await update.message.reply_text(f"✅ Active collection set to: `{name}`", parse_mode="Markdown")
-
-async def fav_shortcut(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    active_collections[chat_id] = ["favorites"]
-    await update.message.reply_text("⭐ Active collection set to: `favorites`", parse_mode="Markdown")
-
-async def current(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    names = get_active_collections(chat_id)
-    suffix = ""
-    if chat_id in removing_chats:
-        suffix = " (🗑️ REMOVE MODE ON)"
-    elif chat_id in paused_chats:
-        suffix = " (⏸️ PAUSED)"
-
-    if len(names) == 1:
-        await update.message.reply_text(f"📁 Active collection: {names[0]}{suffix}")
-    else:
-        await update.message.reply_text(f"📁 Active collections: {', '.join(names)}{suffix}")
-
-async def finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    active_collections[chat_id] = [DEFAULT_COLLECTION]
-    paused_chats.discard(chat_id)
-    removing_chats.discard(chat_id)
-    await update.message.reply_text(f"✅ Reset active collection to: {DEFAULT_COLLECTION}")
-
-async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    task = _active_tasks.get(chat_id)
-    if task and not task.done():
-        task.cancel()
-    paused_chats.add(chat_id)
-    await update.message.reply_text("🛑 Cancelled active processes and paused saving.")
-
-async def minlength(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if not context.args:
-        curr = min_video_length.get(chat_id)
-        msg = f"⏱️ Current min length filter: {curr} seconds" if curr else "⏱️ Min length filter is currently OFF."
-        await update.message.reply_text(f"{msg}\nUsage: /minlength <seconds> or /minlength off")
-        return
-
-    val = context.args[0].lower()
-    if val in ("off", "0", "disable", "none"):
-        min_video_length.pop(chat_id, None)
-        await update.message.reply_text("⏱️ Min length filter turned OFF.")
-    elif val.isdigit():
-        secs = int(val)
-        if secs < 0:
-            await update.message.reply_text("⚠️ Duration cannot be negative.")
-            return
-        min_video_length[chat_id] = secs
-        await update.message.reply_text(f"⏱️ Min length set to {secs} seconds. Shorter videos will be skipped.")
-    else:
-        await update.message.reply_text("⚠️ Please provide a number in seconds or 'off'.")
-
-async def removemode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if not context.args:
-        status = "ON" if chat_id in removing_chats else "OFF"
-        await update.message.reply_text(f"🗑️ Remove mode is currently {status}.\nUsage: /removemode on|off")
-        return
-
-    val = context.args[0].lower()
-    if val in ("on", "1", "enable", "true"):
-        removing_chats.add(chat_id)
-        await update.message.reply_text("🗑️ Remove mode ON. Forwarded videos will be deleted from active collection(s).")
-    elif val in ("off", "0", "disable", "false"):
-        removing_chats.discard(chat_id)
-        await update.message.reply_text("🗑️ Remove mode OFF. Videos will be saved normally.")
-    else:
-        await update.message.reply_text("⚠️ Please specify 'on' or 'off'.")
-
-# ----------------------------------------------------------------------
-# Remove by reply, status, count, info, setexpiry
-# ----------------------------------------------------------------------
-async def remove_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    reply = update.message.reply_to_message
-    if not reply:
-        await update.message.reply_text("⚠️ Reply to a video message with /remove to delete it.")
-        return
-
-    file_unique_id = None
-    if reply.video:
-        file_unique_id = reply.video.file_unique_id
-    elif reply.document and _is_video_document(reply):
-        file_unique_id = reply.document.file_unique_id
-
-    if not file_unique_id:
-        await update.message.reply_text("⚠️ The replied message doesn't contain a valid video.")
-        return
-
-    collections = get_active_collections(chat_id)
-    deleted_from = []
-    for col in collections:
-        if await _delete_video_from_collection(col, file_unique_id):
-            deleted_from.append(col)
-
-    if deleted_from:
-        await update.message.reply_text(f"🗑️ Deleted video from: {', '.join(deleted_from)}")
-    else:
-        await update.message.reply_text("⚠️ Video was not found in active collection(s).")
-
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    collections = get_active_collections(chat_id)
-
-    try:
-        def _query(conn):
-            with conn.cursor() as cur:
-                counts = {}
-                for col in collections:
-                    cur.execute("SELECT COUNT(*) FROM videos WHERE collection = %s", (col,))
-                    counts[col] = cur.fetchone()[0]
-                return counts
-        counts = await db_run(_query)
-    except Exception as e:
-        await reply_db_error(update, "fetch status", e)
-        return
-
-    lines = [f"📊 *Status* (Active: {', '.join(collections)})"]
-    for col, count in counts.items():
-        lines.append(f"• `{col}`: {count} video(s)")
-
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-async def count_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /count <collection>")
-        return
-    name = normalize_name(" ".join(context.args))
-
-    try:
-        def _query(conn):
-            with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM videos WHERE collection = %s", (name,))
-                return cur.fetchone()[0]
-        count = await db_run(_query)
-        await update.message.reply_text(f"📊 Collection `{name}` contains {count} video(s).", parse_mode="Markdown")
-    except Exception as e:
-        await reply_db_error(update, f"count '{name}'", e)
-
-async def collection_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /info <collection>")
-        return
-    name = normalize_name(" ".join(context.args))
-
-    try:
-        def _query(conn):
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT COUNT(*), SUM(file_size), AVG(duration), MIN(added_at), MAX(added_at)
-                    FROM videos WHERE collection = %s
-                    """,
-                    (name,),
-                )
-                return cur.fetchone()
-        count, total_size, avg_dur, first_added, last_added = await db_run(_query)
-    except Exception as e:
-        await reply_db_error(update, f"fetch info for '{name}'", e)
-        return
-
-    if not count:
-        await update.message.reply_text(f"No videos in '{name}'.")
-        return
-
-    size_mb = (total_size / 1024 / 1024) if total_size else 0
-    avg_dur_str = f"{int(avg_dur)}s" if avg_dur else "Unknown"
-    first_str = first_added.strftime("%Y-%m-%d %H:%M") if first_added else "Unknown"
-    last_str = last_added.strftime("%Y-%m-%d %H:%M") if last_added else "Unknown"
-
-    info = (
-        f"ℹ️ *Collection Info:* `{name}`\n"
-        f"• Total Videos: {count}\n"
-        f"• Storage Used: {size_mb:.2f} MB\n"
-        f"• Avg Duration: {avg_dur_str}\n"
-        f"• First Added: {first_str}\n"
-        f"• Last Added: {last_str}"
-    )
-    await update.message.reply_text(info, parse_mode="Markdown")
-
-async def set_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_check(update):
-        return
-    if not context.args or len(context.args) < 2:
-        await update.message.reply_text("Usage: /setexpiry <collection> <days>\nUse 0 days to disable expiry.")
-        return
-
-    days_str = context.args[-1]
-    name = normalize_name(" ".join(context.args[:-1]))
-
-    if not days_str.isdigit():
-        await update.message.reply_text("⚠️ Days must be a positive integer.")
-        return
-    days = int(days_str)
-
-    try:
-        def _set(conn):
-            with conn.cursor() as cur:
-                if days <= 0:
-                    cur.execute("DELETE FROM collection_settings WHERE collection = %s", (name,))
-                else:
-                    cur.execute(
-                        """
-                        INSERT INTO collection_settings (collection, expiry_days)
-                        VALUES (%s, %s)
-                        ON CONFLICT (collection) DO UPDATE SET expiry_days = EXCLUDED.expiry_days
-                        """,
-                        (name, days),
-                    )
-        await db_run(_set)
-        if days > 0:
-            await update.message.reply_text(f"⏰ Set auto-expiry for `{name}` to {days} days.", parse_mode="Markdown")
-        else:
-            await update.message.reply_text(f"⏰ Disabled auto-expiry for `{name}`.", parse_mode="Markdown")
-    except Exception as e:
-        await reply_db_error(update, "set expiry", e)
-
-# ----------------------------------------------------------------------
-# Folder & collection management: delete, rename, move, copy, merge, dups
-# ----------------------------------------------------------------------
-async def delete_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /delete <name>")
-        return
-    name = normalize_name(" ".join(context.args))
-
-    try:
-        def _count(conn):
-            with conn.cursor() as cur:
-                clause, params = _under_clause(name)
-                cur.execute(f"SELECT COUNT(*) FROM videos WHERE {clause}", params)
-                return cur.fetchone()[0]
-        total = await db_run(_count)
-    except Exception as e:
-        await reply_db_error(update, f"check '{name}'", e)
-        return
-
-    if total == 0:
-        await update.message.reply_text(f"No collection or folder matching '{name}'.")
-        return
-
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("YES, DELETE EVERYTHING", callback_data=f"confirmdelete:{name}")],
-        [InlineKeyboardButton("CANCEL", callback_data="canceldelete")],
-    ])
-
-    await update.message.reply_text(
-        f"⚠️ Are you sure you want to delete `{name}` and all nested folders? ({total} video(s) will be permanently lost)",
-        reply_markup=keyboard,
-        parse_mode="Markdown",
-    )
-
-async def confirm_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    name = query.data[len("confirmdelete:"):]
-
-    try:
-        def _delete(conn):
-            with conn.cursor() as cur:
-                clause, params = _under_clause(name)
-                cur.execute(
-                    f"DELETE FROM videos WHERE {clause}",
-                    params,
-                )
-                return cur.rowcount
-
-        count = await db_run(_delete)
-    except Exception as e:
-        await reply_db_error(update, f"delete '{name}'", e)
-        return
-
-    await query.edit_message_text(f"✅ Deleted folder `{name}` ({count} items deleted).")
-
-async def cancel_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("❎ Deletion cancelled.")
-
-
-async def rename_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    parsed = _parse_arrow_pair(context.args or [])
-    if not parsed:
-        await update.message.reply_text(
-            "Usage: /rename <old> -> <new>\n"
-            "Examples:\n"
-            "  /rename movies -> films\n"
-            "  /rename movies/action -> movies/classic-action"
-        )
-        return
-    src, dest = parsed
-    err = validate_collection_path(dest)
-    if err:
-        await update.message.reply_text(f"⚠️ Destination path is invalid: {describe_path_error(err)}")
-        return
-
-    try:
-        def _rename(conn):
-            with conn.cursor() as cur:
-                clause, params = _under_clause(src)
-                cur.execute(
-                    f"SELECT DISTINCT collection FROM videos WHERE {clause}",
-                    params,
-                )
-                affected = [c for (c,) in cur.fetchall()]
-                if not affected:
-                    return 0
-
-                renamed_count = 0
-                for old in affected:
-                    if old == src:
-                        new_col = dest
-                    else:
-                        suffix = old[len(src) + 1:]
-                        new_col = f"{dest}/{suffix}"
-                    err_col = validate_collection_path(new_col)
-                    if err_col:
-                        raise ValueError(f"Resulting path '{new_col}' is invalid: {describe_path_error(err_col)}")
-
-                    cur.execute("SELECT file_id, file_unique_id, duration, file_size, file_name FROM videos WHERE collection = %s", (old,))
-                    rows = cur.fetchall()
-                    for fid, fuid, dur, sz, fn in rows:
-                        cur.execute(
-                            "SELECT 1 FROM videos WHERE collection = %s AND file_unique_id = %s",
-                            (new_col, fuid),
-                        )
-                        if cur.fetchone():
-                            cur.execute("DELETE FROM videos WHERE collection = %s AND file_unique_id = %s", (old, fuid))
-                        else:
-                            cur.execute(
-                                """
-                                UPDATE videos
-                                SET collection = %s
-                                WHERE collection = %s AND file_unique_id = %s
-                                """,
-                                (new_col, old, fuid),
-                            )
-                        renamed_count += 1
-                    cur.execute("UPDATE sent_videos SET collection = %s WHERE collection = %s", (new_col, old))
-                    cur.execute("UPDATE collection_settings SET collection = %s WHERE collection = %s", (new_col, old))
-                return renamed_count
-        count = await db_run(_rename)
-        if count == 0:
-            await update.message.reply_text(f"No collection or folder found matching '{src}'.")
-        else:
-            await update.message.reply_text(f"✏️ Renamed `{src}` -> `{dest}` ({count} video(s) updated).", parse_mode="Markdown")
-    except ValueError as ve:
-        await update.message.reply_text(f"⚠️ {ve}")
-    except Exception as e:
-        await reply_db_error(update, f"rename '{src}'", e)
-
-async def move_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    parsed = _parse_arrow_pair(context.args or [])
-    if not parsed:
-        await update.message.reply_text("Usage: /move <src> -> <dest>")
-        return
-    src, dest = parsed
-    err = validate_collection_path(dest)
-    if err:
-        await update.message.reply_text(f"⚠️ Destination path invalid: {describe_path_error(err)}")
-        return
-
-    try:
-        def _move(conn):
-            with conn.cursor() as cur:
-                cur.execute("SELECT file_unique_id FROM videos WHERE collection = %s", (src,))
-                fuids = [r[0] for r in cur.fetchall()]
-                if not fuids:
-                    return 0
-                moved = 0
-                for fuid in fuids:
-                    cur.execute(
-                        "SELECT 1 FROM videos WHERE collection = %s AND file_unique_id = %s",
-                        (dest, fuid),
-                    )
-                    if cur.fetchone():
-                        cur.execute("DELETE FROM videos WHERE collection = %s AND file_unique_id = %s", (src, fuid))
-                    else:
-                        cur.execute(
-                            "UPDATE videos SET collection = %s WHERE collection = %s AND file_unique_id = %s",
-                            (dest, src, fuid),
-                        )
-                    moved += 1
-                return moved
-        count = await db_run(_move)
-        if count == 0:
-            await update.message.reply_text(f"No videos found in '{src}'.")
-        else:
-            await update.message.reply_text(f"📦 Moved {count} video(s) from `{src}` -> `{dest}`.", parse_mode="Markdown")
-    except Exception as e:
-        await reply_db_error(update, "move videos", e)
-
-async def copy_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    parsed = _parse_arrow_pair(context.args or [])
-    if not parsed:
-        await update.message.reply_text("Usage: /copy <src> -> <dest>")
-        return
-    src, dest = parsed
-    err = validate_collection_path(dest)
-    if err:
-        await update.message.reply_text(f"⚠️ Destination path invalid: {describe_path_error(err)}")
-        return
-
-    try:
-        def _copy(conn):
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO videos (collection, file_id, file_unique_id, duration, file_size, file_name)
-                    SELECT %s, file_id, file_unique_id, duration, file_size, file_name
-                    FROM videos WHERE collection = %s
-                    ON CONFLICT (collection, file_unique_id) DO NOTHING
-                    """,
-                    (dest, src),
-                )
-                return cur.rowcount
-        count = await db_run(_copy)
-        await update.message.reply_text(f"📋 Copied {count} video(s) from `{src}` to `{dest}`.", parse_mode="Markdown")
-    except Exception as e:
-        await reply_db_error(update, "copy videos", e)
-
-async def merge_collections(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    parsed = _parse_arrow_pair(context.args or [])
-    if not parsed:
-        await update.message.reply_text("Usage: /merge <source> -> <target>")
-        return
-    src, dest = parsed
-    err = validate_collection_path(dest)
-    if err:
-        await update.message.reply_text(f"⚠️ Destination path invalid: {describe_path_error(err)}")
-        return
-
-    try:
-        def _merge(conn):
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO videos (collection, file_id, file_unique_id, duration, file_size, file_name)
-                    SELECT %s, file_id, file_unique_id, duration, file_size, file_name
-                    FROM videos WHERE collection = %s
-                    ON CONFLICT (collection, file_unique_id) DO NOTHING
-                    """,
-                    (dest, src),
-                )
-                cur.execute("DELETE FROM videos WHERE collection = %s", (src,))
-                return cur.rowcount
-        count = await db_run(_merge)
-        await update.message.reply_text(f"🔀 Merged `{src}` into `{dest}` ({count} video(s) total in destination).", parse_mode="Markdown")
-    except Exception as e:
-        await reply_db_error(update, "merge collections", e)
-
-async def dups_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /dups <collection>")
-        return
-    name = normalize_name(" ".join(context.args))
-
-    try:
-        def _find_dups(conn):
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT file_unique_id, COUNT(*)
-                    FROM videos WHERE collection = %s
-                    GROUP BY file_unique_id HAVING COUNT(*) > 1
-                    """,
-                    (name,),
-                )
-                return cur.fetchall()
-        dups = await db_run(_find_dups)
-        if not dups:
-            await update.message.reply_text(f"✅ No duplicates found in `{name}`.", parse_mode="Markdown")
-        else:
-            await update.message.reply_text(f"⚠️ Found {len(dups)} duplicate video ID(s) in `{name}`.", parse_mode="Markdown")
-    except Exception as e:
-        await reply_db_error(update, f"check duplicates in '{name}'", e)
-
-# ----------------------------------------------------------------------
-# Near duplicates detection & pagination UI
-# ----------------------------------------------------------------------
-_neardup_sessions: Dict[str, Tuple[List[Tuple[Tuple[str, str, int, int], Tuple[str, str, int, int]]], str, int]] = {}
-
-def _fetch_near_duplicates(collection: str) -> List[Tuple[Tuple[str, str, int, int], Tuple[str, str, int, int]]]:
-    def _query(conn):
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT v1.file_id, v1.file_unique_id, v1.duration, v1.file_size,
-                       v2.file_id, v2.file_unique_id, v2.duration, v2.file_size
-                FROM videos v1
-                JOIN videos v2 ON v1.collection = v2.collection AND v1.id < v2.id
-                WHERE v1.collection = %s
-                  AND (
-                    (
-                      v1.duration IS NOT NULL AND v2.duration IS NOT NULL
-                      AND ABS(v1.duration - v2.duration) <= %s
-                      AND v1.file_size IS NOT NULL AND v2.file_size IS NOT NULL
-                      AND v2.file_size BETWEEN v1.file_size * (1 - %s) AND v1.file_size * (1 + %s)
-                    )
-                    OR
-                    (
-                      (v1.duration IS NULL OR v2.duration IS NULL)
-                      AND v1.file_size IS NOT NULL AND v2.file_size IS NOT NULL
-                      AND v2.file_size BETWEEN v1.file_size * (1 - %s) AND v1.file_size * (1 + %s)
-                    )
-                  )
-                ORDER BY v1.id
-                """,
-                (
-                    collection,
-                    NEAR_DUP_DURATION_TOLERANCE_SECONDS,
-                    NEAR_DUP_SIZE_TOLERANCE_FRACTION,
-                    NEAR_DUP_SIZE_TOLERANCE_FRACTION,
-                    NEAR_DUP_SIZE_ONLY_TOLERANCE_FRACTION,
-                    NEAR_DUP_SIZE_ONLY_TOLERANCE_FRACTION,
-                ),
+            conn = psycopg2.connect(
+                host=os.environ.get("PGHOST", "localhost"),
+                port=int(os.environ.get("PGPORT", 5432)),
+                user=os.environ.get("PGUSER", "postgres"),
+                password=os.environ.get("PGPASSWORD", ""),
+                dbname=os.environ.get("PGDATABASE", "postgres"),
+                cursor_factory=RealDictCursor,
             )
-            rows = cur.fetchall()
-            pairs = []
-            for r in rows:
-                v1 = (r[0], r[1], r[2], r[3])
-                v2 = (r[4], r[5], r[6], r[7])
-                pairs.append((v1, v2))
-            return pairs
-    return _db_call(_query)
-
-async def near_duplicates_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if not context.args:
-        await update.message.reply_text("Usage: /neardupes <collection>")
-        return
-    name = normalize_name(" ".join(context.args))
-
-    try:
-        pairs = await db_run(lambda: _fetch_near_duplicates(name))
+        with conn.cursor() as cur:
+            # Adjust table/column names if your schema differs.
+            sql = """
+                SELECT COUNT(*) AS cnt
+                FROM media
+                WHERE folder_id = %s
+            """
+            cur.execute(sql, (folder_id,))
+            row = cur.fetchone()
+            return int(row["cnt"]) if row and row.get("cnt") is not None else 0
     except Exception as e:
-        await reply_db_error(update, f"find near dupes in '{name}'", e)
-        return
+        logger.exception("DB count failed for folder %s: %s", folder_id, e)
+        return 0
+    finally:
+        if conn:
+            conn.close()
 
-    if not pairs:
-        await update.message.reply_text(f"✅ No possible near-duplicates found in `{name}`.", parse_mode="Markdown")
-        return
 
-    token = f"{chat_id}:{name}"
-    _neardup_sessions[token] = (pairs, name, chat_id)
-    await _show_neardup_page(chat_id, token, 1, context, edit_msg=None)
+def fetch_file_ids_for_page(folder_id: str, page: int, page_size: int) -> List[str]:
+    """
+    Fetch Telegram file_id values from Postgres for the given folder and page.
+    Expects environment variables:
+      - DATABASE_URL (preferred) OR
+      - PGHOST, PGPORT, PGUSER, PGPASSWORD, PGDATABASE
 
-async def _show_neardup_page(
-    chat_id: int,
-    token: str,
-    page: int,
-    context: ContextTypes.DEFAULT_TYPE,
-    edit_msg: Optional[Message] = None,
-):
-    session = _neardup_sessions.get(token)
-    if not session:
-        msg = "⏱️ Near-dupe session expired. Run `/neardupes <collection>` again."
-        if edit_msg:
-            await edit_msg.edit_text(msg, parse_mode="Markdown")
+    SQL assumes a table named 'media' with columns:
+      - folder_id (text)
+      - file_id (text)
+      - id (serial) or created_at for ordering
+    """
+    offset = (page - 1) * page_size
+    database_url = os.environ.get("DATABASE_URL")
+    conn = None
+    try:
+        if database_url:
+            conn = psycopg2.connect(database_url, cursor_factory=RealDictCursor)
         else:
-            await context.bot.send_message(chat_id, msg, parse_mode="Markdown")
-        return
+            conn = psycopg2.connect(
+                host=os.environ.get("PGHOST", "localhost"),
+                port=int(os.environ.get("PGPORT", 5432)),
+                user=os.environ.get("PGUSER", "postgres"),
+                password=os.environ.get("PGPASSWORD", ""),
+                dbname=os.environ.get("PGDATABASE", "postgres"),
+                cursor_factory=RealDictCursor,
+            )
 
-    pairs, collection, _ = session
-    total_pairs = len(pairs)
-    total_pages = (total_pairs + NEARDUPES_PAIRS_PER_PAGE - 1) // NEARDUPES_PAIRS_PER_PAGE
-    page = min(max(1, page), total_pages)
-    start_idx = (page - 1) * NEARDUPES_PAIRS_PER_PAGE
-    page_pairs = pairs[start_idx:start_idx + NEARDUPES_PAIRS_PER_PAGE]
-
-    status_text = f"🔎 *Near-duplicates in* `{collection}` — Page {page}/{total_pages} ({total_pairs} pair(s) total)\nSending side-by-side videos..."
-    if edit_msg:
-        progress_msg = await edit_msg.edit_text(status_text, parse_mode="Markdown")
-    else:
-        progress_msg = await context.bot.send_message(chat_id, status_text, parse_mode="Markdown")
-
-    for pair_idx, (v1, v2) in enumerate(page_pairs, start=start_idx + 1):
-        cap1 = f"Pair #{pair_idx} — Video A\n⏱ {v1[2] or '?'}s • 📦 {(v1[3] or 0)/1024/1024:.2f}MB"
-        cap2 = f"Pair #{pair_idx} — Video B\n⏱ {v2[2] or '?'}s • 📦 {(v2[3] or 0)/1024/1024:.2f}MB"
-
-        msg_a = await _send_single_video_with_fallback(chat_id, v1[0], v1[1], cap1, context, collection)
-        msg_b = await _send_single_video_with_fallback(chat_id, v2[0], v2[1], cap2, context, collection)
-
-        t1 = f"{v1[1]}:{collection}"
-        t2 = f"{v2[1]}:{collection}"
-        kb = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("Keep A (Delete B)", callback_data=f"nddel:{t2}"),
-                InlineKeyboardButton("Keep B (Delete A)", callback_data=f"nddel:{t1}"),
-            ],
-            [
-                InlineKeyboardButton("Delete Both", callback_data=f"nddelboth:{t1}:{t2}"),
-                InlineKeyboardButton("Keep Both", callback_data="ndkeep"),
-            ],
-        ])
-        if msg_b:
-            try:
-                await msg_b.reply_text("Choose action for Pair #" + str(pair_idx) + ":", reply_markup=kb)
-            except TelegramError:
-                await context.bot.send_message(chat_id, "Choose action for Pair #" + str(pair_idx) + ":", reply_markup=kb)
-        elif msg_a:
-            try:
-                await msg_a.reply_text("Choose action for Pair #" + str(pair_idx) + ":", reply_markup=kb)
-            except TelegramError:
-                await context.bot.send_message(chat_id, "Choose action for Pair #" + str(pair_idx) + ":", reply_markup=kb)
-
-        await asyncio.sleep(NEARDUP_ALBUM_DELAY)
-
-    nav_buttons = []
-    if page > 1:
-        nav_buttons.append(InlineKeyboardButton("◀️ Prev Page", callback_data=f"ndpage:{token}:{page-1}"))
-    if page < total_pages:
-        nav_buttons.append(InlineKeyboardButton("Next Page ▶️", callback_data=f"ndpage:{token}:{page+1}"))
-
-    rows_kb = []
-    if nav_buttons:
-        rows_kb.append(nav_buttons)
-    rows_kb.append([InlineKeyboardButton("Done / Close", callback_data=f"ndclose:{token}")])
-
-    await context.bot.send_message(
-        chat_id,
-        f"✅ Finished page {page}/{total_pages}.",
-        reply_markup=InlineKeyboardMarkup(rows_kb),
-    )
-
-async def neardup_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    parts = query.data.split(":")
-    token = f"{parts[1]}:{parts[2]}"
-    page = int(parts[3])
-    chat_id = update.effective_chat.id
-    await _show_neardup_page(chat_id, token, page, context, edit_msg=query.message)
-
-async def neardup_del_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    token = query.data[len("nddel:"):]
-    try:
-        fuid, collection = token.split(":", 1)
-    except ValueError:
-        await query.edit_message_text("⚠️ Invalid action.")
-        return
-
-    ok = await _delete_video_from_collection(collection, fuid)
-    if ok:
-        await query.edit_message_text(f"🗑️ Deleted target video from `{collection}`.", parse_mode="Markdown")
-    else:
-        await query.edit_message_text(f"⚠️ Video was not found in `{collection}`.", parse_mode="Markdown")
-
-async def neardup_delboth_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    token = query.data[len("nddelboth:"):]
-    try:
-        t1, t2 = token.split(":", 1)
-        fuid1, col1 = t1.split(":", 1)
-        fuid2, col2 = t2.split(":", 1)
-    except ValueError:
-        await query.edit_message_text("⚠️ Invalid action.")
-        return
-
-    ok1 = await _delete_video_from_collection(col1, fuid1)
-    ok2 = await _delete_video_from_collection(col2, fuid2)
-    msgs = []
-    msgs.append(f"Deleted Video A from `{col1}`" if ok1 else f"Video A not found in `{col1}`")
-    msgs.append(f"Deleted Video B from `{col2}`" if ok2 else f"Video B not found in `{col2}`")
-    await query.edit_message_text("🗑️ " + " | ".join(msgs), parse_mode="Markdown")
-
-async def neardup_keep_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("👍 Kept both videos.")
-
-async def neardup_close_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    token = query.data[len("ndclose:"):]
-    _neardup_sessions.pop(token, None)
-    await query.edit_message_text("✅ Near-duplicates review closed.")
-
-# ----------------------------------------------------------------------
-# Export & Cleanup commands
-# ----------------------------------------------------------------------
-async def export_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /export <collection>")
-        return
-    name = normalize_name(" ".join(context.args))
-
-    try:
-        def _fetch(conn):
-            with conn.cursor() as cur:
-                cur.execute("SELECT file_id FROM videos WHERE collection = %s ORDER BY added_at", (name,))
-                return [r[0] for r in cur.fetchall()]
-        file_ids = await db_run(_fetch)
+        with conn.cursor() as cur:
+            sql = """
+                SELECT file_id
+                FROM media
+                WHERE folder_id = %s
+                ORDER BY id ASC
+                OFFSET %s
+                LIMIT %s
+            """
+            cur.execute(sql, (folder_id, offset, page_size))
+            rows = cur.fetchall()
+            file_ids = [r["file_id"] for r in rows if r.get("file_id")]
+            return file_ids
     except Exception as e:
-        await reply_db_error(update, f"export '{name}'", e)
-        return
+        logger.exception("DB fetch failed for folder %s page %s: %s", folder_id, page, e)
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
+# -----------------------
+# Prefetching
+# -----------------------
+async def prefetch_pages(chat_id: int, folder_id: str, start_page: int, count: int = PREFETCH_COUNT):
+    state = get_state(chat_id, folder_id)
+    for p in range(start_page + 1, start_page + 1 + count):
+        total_pages = compute_total_pages(state["total"], state["page_size"])
+        if p > total_pages:
+            break
+        if p in state["cache"]:
+            continue
+        try:
+            file_ids = fetch_file_ids_for_page(folder_id, p, state["page_size"])
+            state["cache"][p] = file_ids
+            if TESTING:
+                logger.info("Prefetched page %s for folder %s", p, folder_id)
+            await asyncio.sleep(PREFETCH_DELAY_SECONDS)
+        except Exception as e:
+            logger.exception("Prefetch failed for %s page %s: %s", folder_id, p, e)
+
+
+# -----------------------
+# Sending media as album
+# -----------------------
+def build_media_group_from_file_ids(file_ids: List[str]) -> List[InputMediaVideo]:
+    media = []
+    for fid in file_ids:
+        media.append(InputMediaVideo(media=fid))
+    return media
+
+
+def send_page_album_sync(bot: Bot, chat_id: int, folder_id: str, page: int):
+    """
+    Synchronous wrapper to send a page as a media_group.
+    """
+    state = get_state(chat_id, folder_id)
+    page_size = state["page_size"]
+    file_ids = state["cache"].get(page)
+    if file_ids is None:
+        file_ids = fetch_file_ids_for_page(folder_id, page, page_size)
+        state["cache"][page] = file_ids
 
     if not file_ids:
-        await update.message.reply_text(f"No videos found in '{name}'.")
+        try:
+            bot.send_message(chat_id=chat_id, text="No media found for this page.")
+        except Exception:
+            logger.exception("Failed to send 'no media' message to %s", chat_id)
         return
 
-    content = f"# Collection: {name}\n# Total: {len(file_ids)}\n" + "\n".join(file_ids)
-    bio = io.BytesIO(content.encode("utf-8"))
-    bio.name = f"{name}_export.txt"
-
-    await update.message.reply_document(
-        document=bio,
-        caption=f"📄 Exported {len(file_ids)} video reference(s) from `{name}`.",
-        parse_mode="Markdown",
-    )
-
-async def export_json(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /exportjson <collection>")
-        return
-    name = normalize_name(" ".join(context.args))
-
+    media = build_media_group_from_file_ids(file_ids)
     try:
-        def _fetch(conn):
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT file_id, file_unique_id, duration, file_size, file_name, added_at FROM videos WHERE collection = %s ORDER BY added_at",
-                    (name,),
-                )
-                return cur.fetchall()
-        rows = await db_run(_fetch)
+        bot.send_media_group(chat_id=chat_id, media=media)
     except Exception as e:
-        await reply_db_error(update, f"export json '{name}'", e)
-        return
+        logger.exception("Failed to send media_group for %s page %s: %s", folder_id, page, e)
+        # Fallback: send individually with small delay
+        for fid in file_ids:
+            try:
+                bot.send_video(chat_id=chat_id, video=fid)
+                # small synchronous sleep to avoid hammering
+                asyncio.get_event_loop().run_until_complete(asyncio.sleep(0.2))
+            except Exception:
+                logger.exception("Failed to send individual video %s", fid)
 
-    if not rows:
-        await update.message.reply_text(f"No videos found in '{name}'.")
-        return
 
-    data = {
-        "collection": name,
-        "exported_at": datetime.utcnow().isoformat(),
-        "count": len(rows),
-        "videos": [
-            {
-                "file_id": r[0],
-                "file_unique_id": r[1],
-                "duration": r[2],
-                "file_size": r[3],
-                "file_name": r[4],
-                "added_at": r[5].isoformat() if r[5] else None,
-            }
-            for r in rows
-        ],
-    }
+# -----------------------
+# Command handlers
+# -----------------------
+def start_command(update: Update, context: CallbackContext):
+    update.message.reply_text("Hello! Use /list <folder> to view a folder.")
 
-    bio = io.BytesIO(json.dumps(data, indent=2).encode("utf-8"))
-    bio.name = f"{name}_export.json"
 
-    await update.message.reply_document(
-        document=bio,
-        caption=f"📋 Exported JSON for `{name}` ({len(rows)} videos).",
-        parse_mode="Markdown",
-    )
-
-async def import_json(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_check(update):
-        return
-    reply = update.message.reply_to_message
-    if not reply or not reply.document or not reply.document.file_name.endswith(".json"):
-        await update.message.reply_text("Usage: Reply to a JSON backup file with /importjson")
-        return
-
-    try:
-        doc = await reply.document.get_file()
-        content = await doc.download_as_bytearray()
-        data = json.loads(content.decode("utf-8"))
-        collection = data.get("collection")
-        videos = data.get("videos", [])
-        if not collection or not videos:
-            await update.message.reply_text("⚠️ Invalid JSON file format.")
-            return
-
-        imported = 0
-        skipped = 0
-
-        def _import(conn):
-            nonlocal imported, skipped
-            with conn.cursor() as cur:
-                for v in videos:
-                    cur.execute(
-                        """
-                        INSERT INTO videos (collection, file_id, file_unique_id, duration, file_size, file_name)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (collection, file_unique_id) DO NOTHING
-                        """,
-                        (collection, v["file_id"], v["file_unique_id"], v.get("duration"), v.get("file_size"), v.get("file_name")),
-                    )
-                    if cur.rowcount > 0:
-                        imported += 1
-                    else:
-                        skipped += 1
-        await db_run(_import)
-        await update.message.reply_text(
-            f"📥 Imported JSON into `{collection}`:\n• Imported: {imported}\n• Skipped (duplicates): {skipped}",
-            parse_mode="Markdown",
-        )
-    except Exception as e:
-        await reply_db_error(update, "import JSON", e)
-
-async def cleanup_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /cleanup <collection>")
-        return
-    name = normalize_name(" ".join(context.args))
-
-    try:
-        def _cleanup(conn):
-            with conn.cursor() as cur:
-                cur.execute(
-                    "DELETE FROM videos WHERE collection = %s AND file_unique_id IN (SELECT file_unique_id FROM dead_files)",
-                    (name,),
-                )
-                removed = cur.rowcount
-                cur.execute(
-                    "DELETE FROM dead_files d WHERE NOT EXISTS (SELECT 1 FROM videos v WHERE v.file_unique_id = d.file_unique_id)"
-                )
-                return removed
-        removed = await db_run(_cleanup)
-        await update.message.reply_text(f"🧹 Cleaned up `{name}`. Removed {removed} dead file reference(s).", parse_mode="Markdown")
-    except Exception as e:
-        await reply_db_error(update, f"cleanup '{name}'", e)
-
-async def cleanupnow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pass
-
-async def backup_database(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_check(update):
-        return
-
-    try:
-        def _dump(conn):
-            with conn.cursor() as cur:
-                cur.execute("SELECT collection, file_id, file_unique_id, duration, file_size, file_name, added_at FROM videos")
-                return cur.fetchall()
-        rows = await db_run(_dump)
-        data = [
-            {
-                "collection": r[0],
-                "file_id": r[1],
-                "file_unique_id": r[2],
-                "duration": r[3],
-                "file_size": r[4],
-                "file_name": r[5],
-                "added_at": r[6].isoformat() if r[6] else None,
-            }
-            for r in rows
-        ]
-
-        bio = io.BytesIO(json.dumps(data, indent=2).encode("utf-8"))
-        bio.name = f"backup_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
-
-        await update.message.reply_document(
-            document=bio,
-            caption=f"💾 Full database backup ({len(rows)} records).",
-        )
-    except Exception as e:
-        await reply_db_error(update, "backup database", e)
-
-# ----------------------------------------------------------------------
-# Helper: format DB errors cleanly
-# ----------------------------------------------------------------------
-async def reply_db_error(update: Update, action_desc: str, err: Exception):
-    err_str = str(err).lower()
-    if "connection" in err_str or "timeout" in err_str or "closed" in err_str:
-        user_msg = f"⚠️ Database connection issue while trying to {action_desc}. Please try again in a moment."
-    else:
-        user_msg = f"⚠️ Database error while trying to {action_desc}."
-    logger.exception("DB Exception during: %s", action_desc)
-
-    try:
-        if update.effective_message:
-            await update.effective_message.reply_text(user_msg)
-        elif update.callback_query:
-            await update.callback_query.message.reply_text(user_msg)
-    except TelegramError:
-        pass
-
-# ----------------------------------------------------------------------
-# Webhook & Server Setup
-# ----------------------------------------------------------------------
-async def health_check(request):
-    return PlainTextResponse("OK", status_code=200)
-
-async def telegram_webhook(request):
-    secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
-    if secret != WEBHOOK_SECRET:
-        logger.warning("Invalid webhook secret token.")
-        return Response(status_code=403)
-    try:
-        body = await request.json()
-        update = Update.de_json(body, app.bot)
-        await app.process_update(update)
-        return Response(status_code=200)
-    except Exception as e:
-        logger.exception("Error processing webhook update: %s", e)
-        return Response(status_code=500)
-
-async def _filter_filter(update: Update) -> bool:
+def list_command(update: Update, context: CallbackContext):
+    """
+    Usage: /list <folder_id>
+    Shows the first page and a persistent navigation keyboard.
+    """
     chat_id = update.effective_chat.id
-    min_len = min_video_length.get(chat_id)
-    if min_len is None:
-        return True
-    video = update.message.video
-    if video and video.duration is not None:
-        return video.duration >= min_len
-    return True
+    args = context.args
+    if not args:
+        update.message.reply_text("Usage: /list <folder_id>")
+        return
+    folder_id = args[0]
+    state = get_state(chat_id, folder_id)
+    total = fetch_total_items_for_folder(folder_id)
+    state["total"] = total
+    state["page"] = 1
+    state["cache"].clear()
+    state["awaiting_jump"] = False
 
-# ----------------------------------------------------------------------
-# Application Initialization
-# ----------------------------------------------------------------------
-init_db()
+    total_pages = compute_total_pages(total, state["page_size"])
+    page = state["page"]
 
-app = Application.builder().token(BOT_TOKEN).build()
+    text = f"Collection: {folder_id}\nPage {page}/{total_pages} (Videos {(page-1)*state['page_size']+1}–{min(page*state['page_size'], total)} of {total})"
+    keyboard = build_nav_keyboard(folder_id, page, total_pages)
 
-app.add_handler(TypeHandler(Update, access_control), group=-1)
+    sent = update.message.reply_text(text=text, reply_markup=keyboard)
+    state["message_id"] = sent.message_id
 
-# Handlers
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("help", help_command))
-app.add_handler(CommandHandler("menu", menu_command))
-app.add_handler(CommandHandler("settings", settings_command))
-app.add_handler(CommandHandler("collect", collect))
-app.add_handler(CommandHandler("fav", fav_shortcut))
-app.add_handler(CommandHandler("current", current))
-app.add_handler(CommandHandler("finish", finish))
-app.add_handler(CommandHandler("stop", stop_command))
-app.add_handler(CommandHandler("minlength", minlength))
-app.add_handler(CommandHandler("removemode", removemode))
-app.add_handler(CommandHandler("remove", remove_video))
-app.add_handler(CommandHandler("status", status))
-app.add_handler(CommandHandler("count", count_collection))
-app.add_handler(CommandHandler("info", collection_info))
-app.add_handler(CommandHandler("setexpiry", set_expiry))
-app.add_handler(CommandHandler("get", get_collection))
-app.add_handler(CommandHandler("getbysize", get_by_size))
-app.add_handler(CommandHandler("list", list_collections))
-app.add_handler(CommandHandler("random", random_video))
-app.add_handler(CommandHandler("search", search_videos))
-app.add_handler(CommandHandler("find", find_videos))
-app.add_handler(CommandHandler("retryfailed", retry_failed))
-app.add_handler(CommandHandler("delete", delete_collection))
-app.add_handler(CommandHandler("rename", rename_collection))
-app.add_handler(CommandHandler("move", move_collection))
-app.add_handler(CommandHandler("copy", copy_collection))
-app.add_handler(CommandHandler("merge", merge_collections))
-app.add_handler(CommandHandler("dups", dups_collection))
-app.add_handler(CommandHandler("neardupes", near_duplicates_command))
-app.add_handler(CommandHandler("export", export_collection))
-app.add_handler(CommandHandler("exportjson", export_json))
-app.add_handler(CommandHandler("importjson", import_json))
-app.add_handler(CommandHandler("cleanup", cleanup_collection))
-app.add_handler(CommandHandler("backup", backup_database))
+    # auto-send first page
+    send_page_album_sync(context.bot, chat_id, folder_id, page)
 
-# Callbacks
-app.add_handler(CallbackQueryHandler(menu_callback, pattern="^menu_"))
-app.add_handler(CallbackQueryHandler(menu_folder_callback, pattern="^menufolder:"))
-app.add_handler(CallbackQueryHandler(menu_get_all_callback, pattern="^menugetall:"))
-app.add_handler(CallbackQueryHandler(menu_rand_all_callback, pattern="^menurandall:"))
-app.add_handler(CallbackQueryHandler(menu_set_callback, pattern="^menuset:"))
-app.add_handler(CallbackQueryHandler(menu_view_callback, pattern="^menuview:"))
-app.add_handler(CallbackQueryHandler(menu_random_callback, pattern="^menurandom:"))
-app.add_handler(CallbackQueryHandler(menu_back_callback, pattern="^menu_back$"))
-app.add_handler(CallbackQueryHandler(settings_callback, pattern="^settings:"))
-
-app.add_handler(CallbackQueryHandler(list_page_callback, pattern="^listpage:"))
-app.add_handler(CallbackQueryHandler(list_folder_callback, pattern="^listfolder:"))
-app.add_handler(CallbackQueryHandler(list_choice_callback, pattern="^listchoice:"))
-app.add_handler(CallbackQueryHandler(list_delete_callback, pattern="^listdelete:"))
-app.add_handler(CallbackQueryHandler(list_set_callback, pattern="^listset:"))
-app.add_handler(CallbackQueryHandler(list_get_callback, pattern="^listget:"))
-app.add_handler(CallbackQueryHandler(list_random_callback, pattern="^listrandom:"))
-
-app.add_handler(CallbackQueryHandler(random_next_callback, pattern="^random_next:"))
-app.add_handler(CallbackQueryHandler(random_next_recursive_callback, pattern="^randomnextr:"))
-
-app.add_handler(CallbackQueryHandler(get_page_callback, pattern="^getpage:"))
-app.add_handler(CallbackQueryHandler(get_page_callback, pattern="^getstop:"))
-app.add_handler(CallbackQueryHandler(get_send_callback, pattern="^getsend:"))
-app.add_handler(CallbackQueryHandler(get_cancel_callback, pattern="^getcancel:"))
-app.add_handler(CallbackQueryHandler(cleanupnow_callback, pattern="^cleanupnow:"))
-
-app.add_handler(CallbackQueryHandler(find_page_callback, pattern="^findpage:"))
-app.add_handler(CallbackQueryHandler(find_video_callback, pattern="^findvideo:"))
-app.add_handler(CallbackQueryHandler(find_all_callback, pattern="^findall:"))
-app.add_handler(CallbackQueryHandler(find_close_callback, pattern="^findclose:"))
-
-app.add_handler(CallbackQueryHandler(confirm_delete_callback, pattern="^confirmdelete:"))
-app.add_handler(CallbackQueryHandler(cancel_delete_callback, pattern="^canceldelete$"))
-
-app.add_handler(CallbackQueryHandler(neardup_page_callback, pattern="^ndpage:"))
-app.add_handler(CallbackQueryHandler(neardup_del_callback, pattern="^nddel:"))
-app.add_handler(CallbackQueryHandler(neardup_delboth_callback, pattern="^nddelboth:"))
-app.add_handler(CallbackQueryHandler(neardup_keep_callback, pattern="^ndkeep$"))
-app.add_handler(CallbackQueryHandler(neardup_close_callback, pattern="^ndclose:"))
-
-# Video and file handlers
-app.add_handler(MessageHandler(filters.VIDEO, handle_video))
-app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-app.add_handler(MessageHandler(filters.PHOTO, handle_non_video))
-
-# ----------------------------------------------------------------------
-# Starlette Web Server
-# ----------------------------------------------------------------------
-starlette_app = Starlette(
-    routes=[
-        Route("/health", health_check, methods=["GET"]),
-        Route("/telegram-webhook", telegram_webhook, methods=["POST"]),
-    ]
-)
-
-# ----------------------------------------------------------------------
-# Lifecycle Management
-# ----------------------------------------------------------------------
-async def main():
-    webhook_url = f"{RENDER_EXTERNAL_URL}/telegram-webhook"
-    logger.info("Initializing Telegram bot application...")
-    await app.initialize()
-
-    logger.info("Setting webhook to %s", webhook_url)
-    await app.bot.set_webhook(
-        url=webhook_url,
-        secret_token=WEBHOOK_SECRET,
-        allowed_updates=["message", "callback_query"],
-    )
-
-    commands = [
-        BotCommand("menu", "Open main menu"),
-        BotCommand("collect", "Set active collection"),
-        BotCommand("fav", "Shortcut for favorites collection"),
-        BotCommand("get", "Get videos from collection"),
-        BotCommand("list", "List all collections"),
-        BotCommand("random", "Get random video(s)"),
-        BotCommand("search", "Search videos by filename"),
-        BotCommand("find", "Find videos by duration/size"),
-        BotCommand("retryfailed", "Retry sending failed videos"),
-        BotCommand("status", "Show active collection status"),
-        BotCommand("current", "Show current active collection"),
-        BotCommand("finish", "Reset active collection to default"),
-        BotCommand("stop", "Stop active processes and pause"),
-        BotCommand("settings", "Open settings menu"),
-        BotCommand("help", "Show help and command list"),
-    ]
-    await app.bot.set_my_commands(commands)
-
-    logger.info("Starting bot application...")
-    await app.start()
-
-    logger.info("Starting Web server on port %d...", PORT)
-    config = uvicorn.Config(app=starlette_app, host="0.0.0.0", port=PORT, log_level="info")
-    server = uvicorn.Server(config)
-    
+    # prefetch next pages asynchronously
     try:
-        await server.serve()
-    finally:
-        logger.info("Stopping Telegram application...")
-        await app.stop()
-        await app.shutdown()
+        asyncio.create_task(prefetch_pages(chat_id, folder_id, page, PREFETCH_COUNT))
+    except Exception:
+        # In some environments create_task may not be available; ignore prefetch if so
+        logger.debug("Could not create prefetch task")
+
+
+def goto_command(update: Update, context: CallbackContext):
+    """
+    Usage: /goto <folder_id> <page>
+    Example: /goto mix 42
+    """
+    chat_id = update.effective_chat.id
+    args = context.args
+    if len(args) < 2:
+        update.message.reply_text("Usage: /goto <folder_id> <page>")
+        return
+    folder_id = args[0]
+    try:
+        page = int(args[1])
+    except ValueError:
+        update.message.reply_text("Page must be a number.")
+        return
+
+    state = get_state(chat_id, folder_id)
+    if state["total"] == 0:
+        state["total"] = fetch_total_items_for_folder(folder_id)
+    total_pages = compute_total_pages(state["total"], state["page_size"])
+    page = max(1, min(page, total_pages))
+    state["page"] = page
+    state["cache"].pop(page, None)
+
+    if state.get("message_id"):
+        try:
+            update.effective_message.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=state["message_id"],
+                text=f"Collection: {folder_id}\nPage {page}/{total_pages} (Videos {(page-1)*state['page_size']+1}–{min(page*state['page_size'], state['total'])} of {state['total']})",
+                reply_markup=build_nav_keyboard(folder_id, page, total_pages),
+            )
+        except Exception:
+            pass
+
+    send_page_album_sync(context.bot, chat_id, folder_id, page)
+    try:
+        asyncio.create_task(prefetch_pages(chat_id, folder_id, page, PREFETCH_COUNT))
+    except Exception:
+        logger.debug("Could not create prefetch task")
+
+
+# -----------------------
+# Callback query handler
+# -----------------------
+def callback_query_handler(update: Update, context: CallbackContext):
+    query = update.callback_query
+    data = query.data or ""
+    chat_id = query.message.chat_id
+
+    if data == "noop":
+        query.answer()
+        return
+
+    parts = data.split(":")
+    action = parts[0] if parts else ""
+
+    if action == "nav" and len(parts) >= 3:
+        folder_id = parts[1]
+        nav_action = parts[2]
+        state = get_state(chat_id, folder_id)
+        if state["total"] == 0:
+            state["total"] = fetch_total_items_for_folder(folder_id)
+        total_pages = compute_total_pages(state["total"], state["page_size"])
+
+        if nav_action == "next":
+            if state["page"] < total_pages:
+                state["page"] += 1
+        elif nav_action == "prev":
+            if state["page"] > 1:
+                state["page"] -= 1
+
+        page = state["page"]
+        try:
+            query.edit_message_text(
+                text=f"Collection: {folder_id}\nPage {page}/{total_pages} (Videos {(page-1)*state['page_size']+1}–{min(page*state['page_size'], state['total'])} of {state['total']})",
+                reply_markup=build_nav_keyboard(folder_id, page, total_pages),
+            )
+        except Exception:
+            pass
+
+        send_page_album_sync(context.bot, chat_id, folder_id, page)
+        try:
+            asyncio.create_task(prefetch_pages(chat_id, folder_id, page, PREFETCH_COUNT))
+        except Exception:
+            logger.debug("Could not create prefetch task")
+        query.answer()
+
+    elif action == "send" and len(parts) >= 4:
+        folder_id = parts[1]
+        try:
+            page = int(parts[3])
+        except Exception:
+            page = 1
+        send_page_album_sync(context.bot, chat_id, folder_id, page)
+        query.answer(text=f"Sent page {page}")
+
+    elif action == "jump" and len(parts) >= 2:
+        folder_id = parts[1]
+        state = get_state(chat_id, folder_id)
+        state["awaiting_jump"] = True
+        try:
+            query.edit_message_text(
+                text=f"Enter page number to jump to (1–{compute_total_pages(state['total'] or fetch_total_items_for_folder(folder_id), state['page_size'])}):",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data=f"cancel:{folder_id}")]]),
+            )
+        except Exception:
+            pass
+        query.answer(text="Send the page number as a message now.")
+
+    elif action == "cancel" and len(parts) >= 2:
+        folder_id = parts[1]
+        state = get_state(chat_id, folder_id)
+        state["awaiting_jump"] = False
+        total_pages = compute_total_pages(state["total"] or fetch_total_items_for_folder(folder_id), state["page_size"])
+        try:
+            query.edit_message_text(
+                text=f"Collection: {folder_id}\nPage {state['page']}/{total_pages} (Videos {(state['page']-1)*state['page_size']+1}–{min(state['page']*state['page_size'], state['total'])} of {state['total']})",
+                reply_markup=build_nav_keyboard(folder_id, state["page"], total_pages),
+            )
+        except Exception:
+            pass
+        query.answer(text="Cancelled.")
+
+    else:
+        query.answer()
+
+
+# -----------------------
+# Message handler for jump input
+# -----------------------
+def text_message_handler(update: Update, context: CallbackContext):
+    chat_id = update.effective_chat.id
+    text = update.message.text.strip()
+    awaiting = [(k, v) for k, v in PAGINATION_STATE.items() if k[0] == chat_id and v.get("awaiting_jump")]
+    if not awaiting:
+        return
+
+    (c_id, folder_id), state = awaiting[0]
+    m = re.search(r"\d+", text)
+    if not m:
+        update.message.reply_text("Please send a valid page number.")
+        return
+    page = int(m.group(0))
+    if state["total"] == 0:
+        state["total"] = fetch_total_items_for_folder(folder_id)
+    total_pages = compute_total_pages(state["total"], state["page_size"])
+    page = max(1, min(page, total_pages))
+    state["page"] = page
+    state["awaiting_jump"] = False
+
+    if state.get("message_id"):
+        try:
+            context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=state["message_id"],
+                text=f"Collection: {folder_id}\nPage {page}/{total_pages} (Videos {(page-1)*state['page_size']+1}–{min(page*state['page_size'], state['total'])} of {state['total']})",
+                reply_markup=build_nav_keyboard(folder_id, page, total_pages),
+            )
+        except Exception:
+            pass
+
+    send_page_album_sync(context.bot, chat_id, folder_id, page)
+    try:
+        asyncio.create_task(prefetch_pages(chat_id, folder_id, page, PREFETCH_COUNT))
+    except Exception:
+        logger.debug("Could not create prefetch task")
+
+
+# -----------------------
+# Bot setup
+# -----------------------
+def main():
+    if TOKEN == "YOUR_BOT_TOKEN_HERE":
+        logger.warning("BOT_TOKEN not set. Replace TOKEN or set BOT_TOKEN environment variable.")
+    updater = Updater(TOKEN, use_context=True)
+    dp = updater.dispatcher
+
+    dp.add_handler(CommandHandler("start", start_command))
+    dp.add_handler(CommandHandler("list", list_command))
+    dp.add_handler(CommandHandler("goto", goto_command))
+    dp.add_handler(CallbackQueryHandler(callback_query_handler))
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, text_message_handler))
+
+    updater.start_polling()
+    logger.info("Bot started")
+    updater.idle()
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
