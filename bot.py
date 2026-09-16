@@ -59,6 +59,7 @@ GET_PAGINATION_LIMIT = 5
 GET_PAGE_TIMEOUT = 120
 NEARDUPES_PAIRS_PER_PAGE = 5
 NEARDUP_ALBUM_DELAY = 1.0
+SAVE_SUMMARY_DEBOUNCE_SECONDS = 2.5
 
 NEAR_DUP_DURATION_TOLERANCE_SECONDS = 2
 NEAR_DUP_SIZE_TOLERANCE_FRACTION = 0.05
@@ -71,6 +72,8 @@ removing_chats: Set[int] = set()
 min_video_length: Dict[int, int] = {}
 _active_tasks: Dict[int, asyncio.Task] = {}
 _get_sessions: Dict[int, Tuple[List[str], str, int, Message]] = {}
+_save_counts: Dict[int, Dict] = {}
+_save_notify_tasks: Dict[int, asyncio.Task] = {}
 
 # ----------------------------------------------------------------------
 # Path & Validation Utilities
@@ -103,7 +106,7 @@ def get_active_collections(chat_id: int) -> List[str]:
     return active_collections.get(chat_id, [DEFAULT_COLLECTION])
 
 def _under_clause() -> str:
-    return "(collection = %s OR collection LIKE %s || '/%')"
+    return "(collection = %s OR collection LIKE %s || '/%%')"
 
 def _is_video_document(msg: Message) -> bool:
     if not msg.document:
@@ -230,6 +233,43 @@ async def _delete_video_from_collection(collection: str, file_unique_id: str) ->
             return cur.rowcount > 0
     return await db_run(_delete)
 
+async def _flush_save_summary(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        await asyncio.sleep(SAVE_SUMMARY_DEBOUNCE_SECONDS)
+    except asyncio.CancelledError:
+        return
+    stats = _save_counts.pop(chat_id, None)
+    _save_notify_tasks.pop(chat_id, None)
+    if not stats:
+        return
+
+    parts = []
+    if stats["saved"]:
+        parts.append(f"✅ Saved {stats['saved']} video(s)")
+    if stats["removed"]:
+        parts.append(f"🗑️ Removed {stats['removed']} video(s)")
+    if stats["skipped"]:
+        parts.append(f"↩️ Skipped {stats['skipped']} duplicate(s)")
+    if not parts:
+        return
+
+    cols = ", ".join(f"`{c}`" for c in sorted(stats["cols"]))
+    text = " · ".join(parts) + (f" — {cols}" if cols else "")
+    try:
+        await context.bot.send_message(chat_id, text, parse_mode="Markdown")
+    except TelegramError:
+        pass
+
+def _record_activity(chat_id: int, collection: str, kind: str, context: ContextTypes.DEFAULT_TYPE):
+    stats = _save_counts.setdefault(chat_id, {"saved": 0, "skipped": 0, "removed": 0, "cols": set()})
+    stats[kind] += 1
+    stats["cols"].add(collection)
+
+    existing = _save_notify_tasks.get(chat_id)
+    if existing and not existing.done():
+        existing.cancel()
+    _save_notify_tasks[chat_id] = asyncio.create_task(_flush_save_summary(chat_id, context))
+
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if chat_id in paused_chats:
@@ -248,9 +288,11 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for col in collections:
         if is_remove:
-            await _delete_video_from_collection(col, video.file_unique_id)
+            removed = await _delete_video_from_collection(col, video.file_unique_id)
+            _record_activity(chat_id, col, "removed" if removed else "skipped", context)
         else:
-            await _save_video_to_db(col, video.file_id, video.file_unique_id, video.duration, video.file_size, getattr(video, "file_name", None))
+            saved = await _save_video_to_db(col, video.file_id, video.file_unique_id, video.duration, video.file_size, getattr(video, "file_name", None))
+            _record_activity(chat_id, col, "saved" if saved else "skipped", context)
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -267,9 +309,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for col in collections:
         if is_remove:
-            await _delete_video_from_collection(col, doc.file_unique_id)
+            removed = await _delete_video_from_collection(col, doc.file_unique_id)
+            _record_activity(chat_id, col, "removed" if removed else "skipped", context)
         else:
-            await _save_video_to_db(col, doc.file_id, doc.file_unique_id, None, doc.file_size, doc.file_name)
+            saved = await _save_video_to_db(col, doc.file_id, doc.file_unique_id, None, doc.file_size, doc.file_name)
+            _record_activity(chat_id, col, "saved" if saved else "skipped", context)
 
 async def handle_non_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pass
