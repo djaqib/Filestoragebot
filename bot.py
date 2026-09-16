@@ -105,8 +105,16 @@ def describe_path_error(err_code: str) -> str:
 def get_active_collections(chat_id: int) -> List[str]:
     return active_collections.get(chat_id, [DEFAULT_COLLECTION])
 
-def _under_clause() -> str:
-    return "(collection = %s OR collection LIKE %s || '/%%')"
+def _under_clause(name: str) -> Tuple[str, Tuple[str, str]]:
+    """SQL fragment + params matching a collection or anything nested under it
+    (e.g. 'movies' also matches 'movies/action'). Always use this instead of
+    hand-writing a 'collection LIKE ... /%' clause: building the '/%' pattern
+    directly into the SQL text is what caused the repeated escaping bug,
+    since psycopg2 scans the whole query string for '%'. Passing the pattern
+    as a bound parameter instead avoids that entirely.
+    Usage: clause, params = _under_clause(name); cur.execute(f"... WHERE {clause}", params)
+    """
+    return "(collection = %s OR collection LIKE %s)", (name, f"{name}/%")
 
 def _is_video_document(msg: Message) -> bool:
     if not msg.document:
@@ -393,9 +401,8 @@ async def _show_main_menu(chat_id: int, context: ContextTypes.DEFAULT_TYPE, edit
         logger.exception("Error loading main menu")
         folders = []
 
-    keyboard = []
-    for f in folders:
-        keyboard.append([InlineKeyboardButton(f"📁 {f}", callback_data=f"menufolder:{f}")])
+    folder_buttons = [InlineKeyboardButton(f"📁 {f}", callback_data=f"menufolder:{f}") for f in folders]
+    keyboard = [folder_buttons[i:i + 2] for i in range(0, len(folder_buttons), 2)]
     keyboard.append([InlineKeyboardButton("⚙️ Settings", callback_data="menu_settings")])
 
     text = "📁 *Main Menu*\nSelect a folder to browse:"
@@ -420,9 +427,10 @@ async def menu_folder_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         def _get_sub_items(conn):
             with conn.cursor() as cur:
+                clause, params = _under_clause(folder_prefix)
                 cur.execute(
-                    "SELECT DISTINCT collection FROM videos WHERE collection = %s OR collection LIKE %s || '/%'",
-                    (folder_prefix, folder_prefix),
+                    f"SELECT DISTINCT collection FROM videos WHERE {clause}",
+                    params,
                 )
                 cols = [r[0] for r in cur.fetchall()]
                 subfolders = set()
@@ -561,12 +569,10 @@ async def list_folder_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         def _fetch_sub(conn):
             with conn.cursor() as cur:
-                like_pattern = f"{folder}/%"
-                # Postgres (psycopg2) requires %s placeholders.
-                # Passing like_pattern as a parameter prevents % formatting clashes.
+                clause, params = _under_clause(folder)
                 cur.execute(
-                    "SELECT DISTINCT collection FROM videos WHERE collection = %s OR collection LIKE %s",
-                    (folder, like_pattern),
+                    f"SELECT DISTINCT collection FROM videos WHERE {clause}",
+                    params,
                 )
                 all_cols = [r[0] for r in cur.fetchall()]
                 subitems = set()
@@ -649,10 +655,10 @@ async def list_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         def _count(conn):
             with conn.cursor() as cur:
-                like_pattern = f"{name}/%"
+                clause, params = _under_clause(name)
                 cur.execute(
-                    "SELECT COUNT(*) FROM videos WHERE collection = %s OR collection LIKE %s",
-                    (name, like_pattern),
+                    f"SELECT COUNT(*) FROM videos WHERE {clause}",
+                    params,
                 )
                 return cur.fetchone()[0]
 
@@ -711,7 +717,8 @@ async def get_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         def _fetch(conn):
             with conn.cursor() as cur:
-                cur.execute(f"SELECT file_id, file_unique_id FROM videos WHERE {_under_clause()} ORDER BY added_at", (name, name))
+                clause, params = _under_clause(name)
+                cur.execute(f"SELECT file_id, file_unique_id FROM videos WHERE {clause} ORDER BY added_at", params)
                 return cur.fetchall()
         rows = await db_run(_fetch)
     except Exception as e:
@@ -822,9 +829,10 @@ async def random_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         def _fetch_rand(conn):
             with conn.cursor() as cur:
+                clause, params = _under_clause(name)
                 cur.execute(
-                    f"SELECT file_id, file_unique_id FROM videos WHERE {_under_clause()} ORDER BY RANDOM() LIMIT 1",
-                    (name, name),
+                    f"SELECT file_id, file_unique_id FROM videos WHERE {clause} ORDER BY RANDOM() LIMIT 1",
+                    params,
                 )
                 return cur.fetchone()
         res = await db_run(_fetch_rand)
@@ -1194,7 +1202,8 @@ async def delete_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         def _count(conn):
             with conn.cursor() as cur:
-                cur.execute(f"SELECT COUNT(*) FROM videos WHERE {_under_clause()}", (name, name))
+                clause, params = _under_clause(name)
+                cur.execute(f"SELECT COUNT(*) FROM videos WHERE {clause}", params)
                 return cur.fetchone()[0]
         total = await db_run(_count)
     except Exception as e:
@@ -1224,10 +1233,10 @@ async def confirm_delete_callback(update: Update, context: ContextTypes.DEFAULT_
     try:
         def _delete(conn):
             with conn.cursor() as cur:
-                like_pattern = f"{name}/%"
+                clause, params = _under_clause(name)
                 cur.execute(
-                    "DELETE FROM videos WHERE collection = %s OR collection LIKE %s",
-                    (name, like_pattern),
+                    f"DELETE FROM videos WHERE {clause}",
+                    params,
                 )
                 return cur.rowcount
 
@@ -1263,9 +1272,10 @@ async def rename_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         def _rename(conn):
             with conn.cursor() as cur:
+                clause, params = _under_clause(src)
                 cur.execute(
-                    "SELECT DISTINCT collection FROM videos WHERE collection = %s OR collection LIKE %s || '/%'",
-                    (src, src),
+                    f"SELECT DISTINCT collection FROM videos WHERE {clause}",
+                    params,
                 )
                 affected = [c for (c,) in cur.fetchall()]
                 if not affected:
