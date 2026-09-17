@@ -71,6 +71,14 @@ async def lifespan(app: FastAPI):
 
 # Initialize FastAPI App
 app = FastAPI(lifespan=lifespan)
+from fastapi import FastAPI, Response, status
+
+app = FastAPI()
+
+# Add a health check endpoint for GET and HEAD requests
+@app.api_route("/", methods=["GET", "HEAD"])
+async def health_check():
+    return Response(status_code=status.HTTP_200_OK)
 
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
