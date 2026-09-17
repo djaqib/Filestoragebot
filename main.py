@@ -65,7 +65,6 @@ app.add_handler(CommandHandler("getbysize", handlers.get_by_size))
 app.add_handler(CommandHandler("list", handlers.list_collections))
 app.add_handler(CommandHandler("random", handlers.random_video))
 app.add_handler(CommandHandler("search", handlers.search_videos))
-app.add_handler(CommandHandler("find", handlers.find_videos))
 app.add_handler(CommandHandler("retryfailed", handlers.retry_failed))
 app.add_handler(CommandHandler("delete", handlers.delete_collection))
 app.add_handler(CommandHandler("rename", handlers.rename_collection))
@@ -178,7 +177,6 @@ async def main():
         BotCommand("list", "List all collections"),
         BotCommand("random", "Get random video(s)"),
         BotCommand("search", "Search videos by filename"),
-        BotCommand("find", "Find videos by duration/size"),
         BotCommand("retryfailed", "Retry sending failed videos"),
         BotCommand("status", "Show active collection status"),
         BotCommand("current", "Show current active collection"),
