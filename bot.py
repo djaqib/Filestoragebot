@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import shlex
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -76,6 +77,7 @@ _active_tasks: Dict[int, asyncio.Task] = {}
 _get_sessions: Dict[int, Tuple[List[Tuple[str, str]], str, int, Message]] = {}
 _get_batch_pages: Dict[int, int] = {}
 _awaiting_page_jump: Set[int] = set()
+_search_sessions: Dict[int, List[Tuple[str, str, str, str, Optional[int], Optional[int]]]] = {}
 _save_counts: Dict[int, Dict] = {}
 _save_notify_tasks: Dict[int, asyncio.Task] = {}
 
@@ -376,9 +378,20 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /move <src> -> <dest> - Move videos\n"
         "• /copy <src> -> <dest> - Copy videos\n"
         "• /merge <src> -> <dest> - Merge collections\n\n"
-        "🔍 *Search & Utilities*\n"
-        "• /search <query> - Search by filename\n"
-        "• /find - Find by size/duration\n"
+        "🔍 *Search*\n"
+        "• `/search <query>` - keyword search by filename\n"
+        "• Use quotes for a multi-word phrase: `/search \"long video\"`\n"
+        "• Filters can be combined with a query, or used alone:\n"
+        "   ◦ `--min-duration <sec>` - minimum length in seconds\n"
+        "   ◦ `--max-duration <sec>` - maximum length in seconds\n"
+        "   ◦ `--min-size <MB>` - minimum file size in MB\n"
+        "   ◦ `--max-size <MB>` - maximum file size in MB\n"
+        "• Examples:\n"
+        "   ◦ `/search mix --max-duration 300`\n"
+        "   ◦ `/search --min-size 10 --max-size 100`\n"
+        "   ◦ `/search \"long video\" --min-duration 600 --max-size 500`\n"
+        "• Tap any result to receive that video.\n\n"
+        "🧹 *Other Utilities*\n"
         "• /dups <name> - Find exact duplicates\n"
         "• /neardupes <name> - Visual near-duplicate cleanup\n"
         "• /removemode on|off - Toggle auto-delete mode\n"
@@ -594,8 +607,6 @@ async def list_folder_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     keyboard = []
-    if exact:
-        keyboard.append([InlineKeyboardButton("📄 View Action Menu", callback_data=f"listchoice:{folder}")])
 
     # Build folder buttons
     folder_buttons = [
@@ -624,32 +635,6 @@ async def list_folder_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         parse_mode="Markdown",
     )
 
-
-
-
-async def list_choice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    name = query.data[len("listchoice:"):]
-
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📂 Set Active", callback_data=f"listset:{name}"),
-            InlineKeyboardButton("📩 Get Videos", callback_data=f"listget:{name}"),
-            InlineKeyboardButton("🎲 Random", callback_data=f"listrandom:{name}"),
-        ],
-        [
-            InlineKeyboardButton("🗑️ Delete Collection", callback_data=f"listdelete:{name}"),
-        ],
-        [
-            InlineKeyboardButton("⬅️ Back to menu", callback_data="menu_back"),
-        ],
-    ])
-
-    await query.edit_message_text(
-        f"'{name}' — what would you like to do?",
-        reply_markup=keyboard,
-    )
 
 async def list_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -707,9 +692,6 @@ async def list_random_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     name = query.data[len("listrandom:"):]
     context.args = [name]
     await random_video(update, context)
-
-async def list_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pass
 
 # ----------------------------------------------------------------------
 # Retrieving Videos (Get / Pagination / Random / Search / Find)
@@ -929,9 +911,6 @@ async def get_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     _awaiting_page_jump.discard(chat_id)
     await query.edit_message_text("Cancelled retrieval.")
 
-async def get_by_size(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pass
-
 async def random_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     name = normalize_name(" ".join(context.args)) if context.args else get_active_collections(chat_id)[0]
@@ -965,55 +944,155 @@ async def random_next_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     context.args = [name]
     await random_video(update, context)
 
-async def random_next_recursive_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pass
+SEARCH_FLAG_MAP = {
+    "--min-duration": "min_duration",
+    "--max-duration": "max_duration",
+    "--min-size": "min_size_mb",
+    "--max-size": "max_size_mb",
+}
+SEARCH_RESULT_LIMIT = 20
+
+def _escape_ilike(s: str) -> str:
+    return s.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+
+def _parse_search_args(raw_text: str) -> Tuple[Optional[str], Dict[str, float], Optional[str]]:
+    """Parse the text after /search. Returns (query_str_or_None, filters, error_or_None).
+    Supports quoted phrases ("long video") and --min-duration/--max-duration/--min-size/--max-size,
+    in any order relative to the keyword text."""
+    parts = raw_text.split(maxsplit=1)
+    remainder = parts[1] if len(parts) > 1 else ""
+    try:
+        tokens = shlex.split(remainder)
+    except ValueError:
+        return None, {}, "Couldn't parse that — check your quotes."
+
+    filters: Dict[str, float] = {}
+    query_tokens = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        key = SEARCH_FLAG_MAP.get(tok.lower())
+        if key:
+            if i + 1 >= len(tokens):
+                return None, {}, f"Missing a number after {tok}."
+            val_raw = tokens[i + 1]
+            try:
+                val = float(val_raw)
+            except ValueError:
+                return None, {}, f"{tok} needs a number, got '{val_raw}'."
+            filters[key] = val
+            i += 2
+        else:
+            query_tokens.append(tok)
+            i += 1
+
+    query_str = " ".join(query_tokens) if query_tokens else None
+    return query_str, filters, None
+
+def _format_duration(seconds: Optional[int]) -> str:
+    if not seconds:
+        return "?:??"
+    m, s = divmod(int(seconds), 60)
+    return f"{m}:{s:02d}"
+
+def _format_size(num_bytes: Optional[int]) -> str:
+    if not num_bytes:
+        return "?MB"
+    return f"{num_bytes / (1024 * 1024):.0f}MB"
 
 async def search_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /search <query>")
+    raw_text = update.message.text or ""
+    query_str, filters, err = _parse_search_args(raw_text)
+    if err:
+        await update.message.reply_text(f"⚠️ {err}\nSee /help for /search syntax.")
         return
-    query_str = " ".join(context.args)
+    if not query_str and not filters:
+        await update.message.reply_text(
+            "Usage: /search <query> [--min-duration s] [--max-duration s] [--min-size MB] [--max-size MB]\n"
+            "See /help for the full list of filters and examples."
+        )
+        return
+
+    where_clauses = []
+    params: List = []
+    if query_str:
+        where_clauses.append("file_name ILIKE %s")
+        params.append(f"%{_escape_ilike(query_str)}%")
+    if "min_duration" in filters:
+        where_clauses.append("duration >= %s")
+        params.append(int(filters["min_duration"]))
+    if "max_duration" in filters:
+        where_clauses.append("duration <= %s")
+        params.append(int(filters["max_duration"]))
+    if "min_size_mb" in filters:
+        where_clauses.append("file_size >= %s")
+        params.append(int(filters["min_size_mb"] * 1024 * 1024))
+    if "max_size_mb" in filters:
+        where_clauses.append("file_size <= %s")
+        params.append(int(filters["max_size_mb"] * 1024 * 1024))
+    where_sql = " AND ".join(where_clauses)
 
     try:
         def _search(conn):
             with conn.cursor() as cur:
+                cur.execute(f"SELECT COUNT(*) FROM videos WHERE {where_sql}", params)
+                total = cur.fetchone()[0]
                 cur.execute(
-                    "SELECT collection, file_id, file_name FROM videos WHERE file_name ILIKE %s LIMIT 20",
-                    (f"%{query_str}%",),
+                    f"""SELECT collection, file_id, file_unique_id, file_name, duration, file_size
+                        FROM videos WHERE {where_sql}
+                        ORDER BY added_at DESC LIMIT {SEARCH_RESULT_LIMIT}""",
+                    params,
                 )
-                return cur.fetchall()
-        rows = await db_run(_search)
+                return total, cur.fetchall()
+        total, rows = await db_run(_search)
     except Exception as e:
         await reply_db_error(update, "search videos", e)
         return
 
     if not rows:
-        await update.message.reply_text(f"No videos matching '{query_str}'.")
+        await update.message.reply_text("No videos matched those filters.")
         return
 
-    lines = [f"🔍 *Search results for:* `{query_str}`"]
-    for col, fid, fname in rows:
-        lines.append(f"• `{col}`: {fname or 'Unnamed'}")
+    chat_id = update.effective_chat.id
+    results = [(fid, funid, col, fname, dur, size) for col, fid, funid, fname, dur, size in rows]
+    _search_sessions[chat_id] = results
 
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    keyboard = []
+    for idx, (fid, funid, col, fname, dur, size) in enumerate(results):
+        label = f"{fname or 'Unnamed'} · {_format_duration(dur)} · {_format_size(size)}"
+        if len(label) > 60:
+            label = label[:57] + "..."
+        keyboard.append([InlineKeyboardButton(f"🎬 {label}", callback_data=f"searchview:{idx}")])
 
-async def find_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Usage: Use /search <query> or specify parameters.")
+    desc_bits = []
+    if query_str:
+        desc_bits.append(f"'{query_str}'")
+    if filters:
+        desc_bits.append(", ".join(f"{k}={v:g}" for k, v in filters.items()))
+    header = " ".join(desc_bits) or "all videos"
 
-async def find_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pass
+    text = f"🔍 *Search:* {header}\nShowing {len(rows)} of {total} match(es). Tap one to view it."
+    if total > len(rows):
+        text += "\nAdd filters to narrow this down further."
 
-async def find_video_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pass
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-async def find_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pass
+async def search_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = update.effective_chat.id
+    idx = int(query.data.split(":")[1])
 
-async def find_close_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pass
+    results = _search_sessions.get(chat_id)
+    if not results or idx >= len(results):
+        await query.answer("This search result has expired — run /search again.", show_alert=True)
+        return
 
-async def retry_failed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔄 Retrying failed sends...")
+    fid, funid, col, fname, dur, size = results[idx]
+    caption = f"{col} — {fname or 'Unnamed'}"
+    result = await _send_single_video_with_fallback(chat_id, fid, funid, caption, context, col)
+    if result is None:
+        await query.answer("That video couldn't be sent (it's marked dead).", show_alert=True)
 
 # ----------------------------------------------------------------------
 # Settings & State Switchers
@@ -1914,9 +1993,6 @@ async def cleanup_collection(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception as e:
         await reply_db_error(update, f"cleanup '{name}'", e)
 
-async def cleanupnow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pass
-
 async def backup_database(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await admin_check(update):
         return
@@ -2026,12 +2102,9 @@ app.add_handler(CommandHandler("count", count_collection))
 app.add_handler(CommandHandler("info", collection_info))
 app.add_handler(CommandHandler("setexpiry", set_expiry))
 app.add_handler(CommandHandler("get", get_collection))
-app.add_handler(CommandHandler("getbysize", get_by_size))
 app.add_handler(CommandHandler("list", list_collections))
 app.add_handler(CommandHandler("random", random_video))
 app.add_handler(CommandHandler("search", search_videos))
-app.add_handler(CommandHandler("find", find_videos))
-app.add_handler(CommandHandler("retryfailed", retry_failed))
 app.add_handler(CommandHandler("delete", delete_collection))
 app.add_handler(CommandHandler("rename", rename_collection))
 app.add_handler(CommandHandler("move", move_collection))
@@ -2046,6 +2119,7 @@ app.add_handler(CommandHandler("cleanup", cleanup_collection))
 app.add_handler(CommandHandler("backup", backup_database))
 
 # Callbacks
+app.add_handler(CallbackQueryHandler(menu_back_callback, pattern="^menu_back$"))
 app.add_handler(CallbackQueryHandler(menu_callback, pattern="^menu_"))
 app.add_handler(CallbackQueryHandler(menu_folder_callback, pattern="^menufolder:"))
 app.add_handler(CallbackQueryHandler(menu_get_all_callback, pattern="^menugetall:"))
@@ -2053,32 +2127,23 @@ app.add_handler(CallbackQueryHandler(menu_rand_all_callback, pattern="^menuranda
 app.add_handler(CallbackQueryHandler(menu_set_callback, pattern="^menuset:"))
 app.add_handler(CallbackQueryHandler(menu_view_callback, pattern="^menuview:"))
 app.add_handler(CallbackQueryHandler(menu_random_callback, pattern="^menurandom:"))
-app.add_handler(CallbackQueryHandler(menu_back_callback, pattern="^menu_back$"))
 app.add_handler(CallbackQueryHandler(settings_callback, pattern="^settings:"))
 
-app.add_handler(CallbackQueryHandler(list_page_callback, pattern="^listpage:"))
 app.add_handler(CallbackQueryHandler(list_folder_callback, pattern="^listfolder:"))
-app.add_handler(CallbackQueryHandler(list_choice_callback, pattern="^listchoice:"))
 app.add_handler(CallbackQueryHandler(list_delete_callback, pattern="^listdelete:"))
 app.add_handler(CallbackQueryHandler(list_set_callback, pattern="^listset:"))
 app.add_handler(CallbackQueryHandler(list_get_callback, pattern="^listget:"))
 app.add_handler(CallbackQueryHandler(list_random_callback, pattern="^listrandom:"))
 
 app.add_handler(CallbackQueryHandler(random_next_callback, pattern="^random_next:"))
-app.add_handler(CallbackQueryHandler(random_next_recursive_callback, pattern="^randomnextr:"))
 
 app.add_handler(CallbackQueryHandler(get_next_callback, pattern="^getnext$"))
 app.add_handler(CallbackQueryHandler(get_prev_callback, pattern="^getprev$"))
 app.add_handler(CallbackQueryHandler(get_batch_toggle_callback, pattern="^getbatch$"))
 app.add_handler(CallbackQueryHandler(get_jump_callback, pattern="^getjump$"))
 app.add_handler(CallbackQueryHandler(get_cancel_callback, pattern="^getcancel$"))
+app.add_handler(CallbackQueryHandler(search_view_callback, pattern="^searchview:"))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_get_page_jump_text))
-app.add_handler(CallbackQueryHandler(cleanupnow_callback, pattern="^cleanupnow:"))
-
-app.add_handler(CallbackQueryHandler(find_page_callback, pattern="^findpage:"))
-app.add_handler(CallbackQueryHandler(find_video_callback, pattern="^findvideo:"))
-app.add_handler(CallbackQueryHandler(find_all_callback, pattern="^findall:"))
-app.add_handler(CallbackQueryHandler(find_close_callback, pattern="^findclose:"))
 
 app.add_handler(CallbackQueryHandler(confirm_delete_callback, pattern="^confirmdelete:"))
 app.add_handler(CallbackQueryHandler(cancel_delete_callback, pattern="^canceldelete$"))
@@ -2126,9 +2191,7 @@ async def main():
         BotCommand("get", "Get videos from collection"),
         BotCommand("list", "List all collections"),
         BotCommand("random", "Get random video(s)"),
-        BotCommand("search", "Search videos by filename"),
-        BotCommand("find", "Find videos by duration/size"),
-        BotCommand("retryfailed", "Retry sending failed videos"),
+        BotCommand("search", "Search videos (supports filters, see /help)"),
         BotCommand("status", "Show active collection status"),
         BotCommand("current", "Show current active collection"),
         BotCommand("finish", "Reset active collection to default"),
