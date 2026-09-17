@@ -3,7 +3,7 @@ import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 from telegram import Update
-from telegram.ext import Application, CommandHandler, TypeHandler
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, TypeHandler
 
 import db
 import handlers
@@ -21,23 +21,36 @@ RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
 PORT = int(os.getenv("PORT", 10000))
 WEBHOOK_PATH = "/telegram-webhook"
 
+# Parse Extra Render Environment Variables
+ALLOWED_USER_IDS = [
+    int(x.strip()) for x in os.getenv("ALLOWED_USER_IDS", "").split(",") if x.strip()
+]
+ADMIN_LOG_CHANNEL = os.getenv("ADMIN_LOG_CHANNEL")
+BACKUP_CHANNEL_ID = os.getenv("BACKUP_CHANNEL_ID")
+
 if not BOT_TOKEN or not db.DATABASE_URL or not RENDER_EXTERNAL_URL:
     raise ValueError("Missing essential environment variables (BOT_TOKEN, DATABASE_URL, RENDER_EXTERNAL_URL)")
 
 # Initialize Telegram Bot Application
 ptb_app = Application.builder().token(BOT_TOKEN).build()
 
-# Register Handlers
-if hasattr(handlers, 'access_control'):
-    ptb_app.add_handler(TypeHandler(Update, handlers.access_control), group=-1)
+# Store global environment context in bot_data for handlers
+ptb_app.bot_data["allowed_user_ids"] = ALLOWED_USER_IDS
+ptb_app.bot_data["admin_log_channel"] = ADMIN_LOG_CHANNEL
+ptb_app.bot_data["backup_channel_id"] = BACKUP_CHANNEL_ID
 
-ptb_app.add_handler(CommandHandler("search", handlers.search_command))
+# Register Middleware (Access Control check runs first on every update)
+ptb_app.add_handler(TypeHandler(Update, handlers.access_control), group=-1)
+
+# Register Command & Callback Handlers
+ptb_app.add_handler(CommandHandler("start", handlers.start_command))
 ptb_app.add_handler(CommandHandler("help", handlers.help_command))
+ptb_app.add_handler(CommandHandler("search", handlers.search_command))
+ptb_app.add_handler(CallbackQueryHandler(handlers.handle_callback))
 
-# Lifespan context manager to handle Telegram Bot startup/shutdown safely with FastAPI
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup logic
+    # Startup: Initialize Database & Register Webhook
     db.init_db()
     logger.info("Database schema initialized.")
     
@@ -49,14 +62,14 @@ async def lifespan(app: FastAPI):
     await ptb_app.start()
     logger.info("Bot application started and webhook registered.")
     
-    yield  # Server runs here
+    yield
     
-    # Shutdown logic
+    # Shutdown
     logger.info("Shutting down bot application...")
     await ptb_app.stop()
     await ptb_app.shutdown()
 
-# Initialize FastAPI app with lifespan
+# Initialize FastAPI App
 app = FastAPI(lifespan=lifespan)
 
 @app.post(WEBHOOK_PATH)
@@ -69,10 +82,9 @@ async def telegram_webhook(request: Request):
 
 @app.get("/")
 async def health_check():
-    """Health check endpoint for Render pinging."""
+    """Health check endpoint for Render."""
     return {"status": "ok"}
 
 if __name__ == "__main__":
     import uvicorn
-    # Blocking Uvicorn call keeps the container alive
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, log_level="info")
