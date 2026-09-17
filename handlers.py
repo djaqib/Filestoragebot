@@ -18,8 +18,8 @@ async def access_control(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # If ALLOWED_USER_IDS is set and user is not in the list, block them
     if allowed_ids and user.id not in allowed_ids:
-        if update.message:
-            await update.message.reply_text("⛔ You are not authorized to use this bot.")
+        if update.effective_message:
+            await update.effective_message.reply_text("⛔ You are not authorized to use this bot.")
 
         # Log breach attempt to ADMIN_LOG_CHANNEL if configured
         admin_channel = context.bot_data.get("admin_log_channel")
@@ -72,7 +72,7 @@ def get_location_menu() -> InlineKeyboardMarkup:
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handles the /start command."""
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         "<b>Welcome!</b> Choose an option below or use /help to see available commands.",
         reply_markup=get_main_menu(),
         parse_mode="HTML"
@@ -97,7 +97,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "<b>Other Commands:</b>\n"
         "• <code>/start</code> - Display the main interactive menu"
     )
-    await update.message.reply_text(help_text, parse_mode="HTML")
+    await update.effective_message.reply_text(help_text, parse_mode="HTML")
 
 
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -105,7 +105,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         args = shlex.split(" ".join(context.args))
     except ValueError:
-        await update.message.reply_text("❌ Quote error. Make sure your quotes are closed properly.")
+        await update.effective_message.reply_text("❌ Quote error. Make sure your quotes are closed properly.")
         return
 
     parser = argparse.ArgumentParser(add_help=False)
@@ -118,7 +118,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         parsed, _ = parser.parse_known_args(args)
     except Exception:
-        await update.message.reply_text("❌ Invalid search flags format.")
+        await update.effective_message.reply_text("❌ Invalid search flags format.")
         return
 
     search_query = " ".join(parsed.query).strip()
@@ -133,19 +133,19 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
     if not results:
-        await update.message.reply_text("❌ No videos found matching your criteria.")
+        await update.effective_message.reply_text("❌ No videos found matching your criteria.")
         return
 
     # Format output message
     response_text = f"<b>Found {len(results)} Video(s):</b>\n\n"
     for vid in results:
-        title = vid.get('title', 'Untitled Video')
-duration = vid.get('duration', 0)
-file_size = vid.get('file_size', 0)
+        title = vid.get('title') or 'Untitled Video'
+        duration = vid.get('duration') or 0
+        file_size = vid.get('file_size') or 0
 
-response_text += f"• <b>{title}</b> ({duration}s | {round(file_size / (1024*1024), 1)} MB)\n"
+        response_text += f"• <b>{title}</b> ({duration}s | {round(file_size / (1024*1024), 1)} MB)\n"
 
-    await update.message.reply_text(response_text, parse_mode="HTML")
+    await update.effective_message.reply_text(response_text, parse_mode="HTML")
 
 
 # ================================
