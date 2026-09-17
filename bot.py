@@ -57,6 +57,8 @@ DEFAULT_COLLECTION = "default"
 GET_BATCH_SIZE = 10
 GET_PAGINATION_LIMIT = 5
 GET_PAGE_TIMEOUT = 120
+GET_MAX_BATCH_PAGES = 3
+GET_ALBUM_SEND_DELAY = 1.5
 NEARDUPES_PAIRS_PER_PAGE = 5
 NEARDUP_ALBUM_DELAY = 1.0
 SAVE_SUMMARY_DEBOUNCE_SECONDS = 2.5
@@ -71,7 +73,9 @@ paused_chats: Set[int] = set()
 removing_chats: Set[int] = set()
 min_video_length: Dict[int, int] = {}
 _active_tasks: Dict[int, asyncio.Task] = {}
-_get_sessions: Dict[int, Dict] = {}
+_get_sessions: Dict[int, Tuple[List[Tuple[str, str]], str, int, Message]] = {}
+_get_batch_pages: Dict[int, int] = {}
+_awaiting_page_jump: Set[int] = set()
 _save_counts: Dict[int, Dict] = {}
 _save_notify_tasks: Dict[int, asyncio.Task] = {}
 
@@ -106,6 +110,14 @@ def get_active_collections(chat_id: int) -> List[str]:
     return active_collections.get(chat_id, [DEFAULT_COLLECTION])
 
 def _under_clause(name: str) -> Tuple[str, Tuple[str, str]]:
+    """SQL fragment + params matching a collection or anything nested under it
+    (e.g. 'movies' also matches 'movies/action'). Always use this instead of
+    hand-writing a 'collection LIKE ... /%' clause: building the '/%' pattern
+    directly into the SQL text is what caused the repeated escaping bug,
+    since psycopg2 scans the whole query string for '%'. Passing the pattern
+    as a bound parameter instead avoids that entirely.
+    Usage: clause, params = _under_clause(name); cur.execute(f"... WHERE {clause}", params)
+    """
     return "(collection = %s OR collection LIKE %s)", (name, f"{name}/%")
 
 def _is_video_document(msg: Message) -> bool:
@@ -585,14 +597,17 @@ async def list_folder_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if exact:
         keyboard.append([InlineKeyboardButton("📄 View Action Menu", callback_data=f"listchoice:{folder}")])
 
+    # Build folder buttons
     folder_buttons = [
         InlineKeyboardButton(f"📁 {s}", callback_data=f"listfolder:{s}")
         for s in subs
     ]
     
+    # Grid layout: group subfolders into rows of 2 buttons each
     for i in range(0, len(folder_buttons), 2):
         keyboard.append(folder_buttons[i:i + 2])
 
+    # Action buttons
     keyboard.append([
         InlineKeyboardButton("📂 Set Active", callback_data=f"listset:{folder}"),
         InlineKeyboardButton("📩 Get Videos", callback_data=f"listget:{folder}"),
@@ -608,6 +623,9 @@ async def list_folder_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown",
     )
+
+
+
 
 async def list_choice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -667,6 +685,7 @@ async def list_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         parse_mode="Markdown",
     )
 
+
 async def list_set_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -693,24 +712,24 @@ async def list_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     pass
 
 # ----------------------------------------------------------------------
-# Retrieving Videos (Get / Media Album Pagination / Page Jump)
+# Retrieving Videos (Get / Pagination / Random / Search / Find)
 # ----------------------------------------------------------------------
 async def get_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     name = normalize_name(" ".join(context.args)) if context.args else get_active_collections(chat_id)[0]
 
     try:
-        def _count_videos(conn):
+        def _fetch(conn):
             with conn.cursor() as cur:
                 clause, params = _under_clause(name)
-                cur.execute(f"SELECT COUNT(*) FROM videos WHERE {clause}", params)
-                return cur.fetchone()[0]
-        total = await db_run(_count_videos)
+                cur.execute(f"SELECT file_id, file_unique_id FROM videos WHERE {clause} ORDER BY added_at", params)
+                return cur.fetchall()
+        rows = await db_run(_fetch)
     except Exception as e:
         await reply_db_error(update, f"get '{name}'", e)
         return
 
-    if total == 0:
+    if not rows:
         msg = f"No videos found in `{name}`."
         if update.callback_query:
             await update.callback_query.edit_message_text(msg, parse_mode="Markdown")
@@ -718,103 +737,140 @@ async def get_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(msg, parse_mode="Markdown")
         return
 
-    _get_sessions[chat_id] = {
-        "name": name,
-        "page": 1,
-        "total": total,
-        "auto_send": True,
-        "control_msg_id": None,
-    }
+    file_rows = [(r[0], r[1]) for r in rows]
+    total = len(file_rows)
+    pages = (total + GET_BATCH_SIZE - 1) // GET_BATCH_SIZE
 
-    await _send_or_update_pagination(chat_id, context, send_videos_immediately=True)
+    session_msg = await context.bot.send_message(
+        chat_id,
+        f"📦 Preparing to send {total} video(s) from `{name}` in pages...",
+        parse_mode="Markdown",
+    )
 
-async def _fetch_page_videos(name: str, page: int, limit: int = GET_BATCH_SIZE):
-    offset = (page - 1) * limit
-    def _fetch(conn):
-        with conn.cursor() as cur:
-            clause, params = _under_clause(name)
-            query = f"""
-                SELECT file_id, file_unique_id 
-                FROM videos 
-                WHERE {clause} 
-                ORDER BY added_at 
-                LIMIT %s OFFSET %s
-            """
-            cur.execute(query, params + (limit, offset))
-            return cur.fetchall()
-    return await db_run(_fetch)
+    _get_sessions[chat_id] = (file_rows, name, 1, session_msg)
+    await _render_get_page(chat_id, context)
 
-async def _send_or_update_pagination(chat_id: int, context: ContextTypes.DEFAULT_TYPE, send_videos_immediately: bool = False):
+async def _send_pages(chat_id: int, file_rows: List[Tuple[str, str]], name: str, start_page: int, end_page: int, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Send pages [start_page, end_page] (inclusive, 1-indexed), one album per page.
+    Falls back to individual sends (marking dead files) if an album fails.
+    A short delay between page-albums keeps multi-page taps flood-safe.
+    Returns the number of videos that failed to send."""
+    failed = 0
+    for pg in range(start_page, end_page + 1):
+        s = (pg - 1) * GET_BATCH_SIZE
+        e = min(s + GET_BATCH_SIZE, len(file_rows))
+        batch = file_rows[s:e]
+        if not batch:
+            break
+
+        sent_ok = True
+        if len(batch) >= 2:
+            # Telegram albums require 2-10 items; GET_BATCH_SIZE (10) fits this exactly.
+            media = [InputMediaVideo(fid) for fid, _ in batch]
+            try:
+                await context.bot.send_media_group(chat_id, media)
+            except TelegramError:
+                sent_ok = False
+        else:
+            sent_ok = False  # single leftover video can't be an album
+
+        if not sent_ok:
+            for fid, funid in batch:
+                result = await _send_single_video_with_fallback(chat_id, fid, funid, "", context, name)
+                if result is None:
+                    failed += 1
+                await asyncio.sleep(0.5)
+
+        if pg < end_page:
+            await asyncio.sleep(GET_ALBUM_SEND_DELAY)
+    return failed
+
+async def _render_get_page(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     session = _get_sessions.get(chat_id)
     if not session:
         return
 
-    name = session["name"]
-    total = session["total"]
-    total_pages = (total + GET_BATCH_SIZE - 1) // GET_BATCH_SIZE
-    page = min(max(1, session["page"]), total_pages)
-    session["page"] = page
+    file_rows, name, page, msg = session
+    total = len(file_rows)
+    total_pages = max(1, (total + GET_BATCH_SIZE - 1) // GET_BATCH_SIZE)
+    page = min(max(1, page), total_pages)
+    batch_pages = _get_batch_pages.get(chat_id, 1)
 
-    if send_videos_immediately:
-        rows = await _fetch_page_videos(name, page, GET_BATCH_SIZE)
-        if rows:
-            media_group = [InputMediaVideo(media=r[0]) for r in rows]
-            try:
-                await context.bot.send_media_group(chat_id=chat_id, media=media_group)
-                await asyncio.sleep(1.0)
-            except TelegramError as e:
-                logger.warning(f"Album send failed, falling back to individual send: {e}")
-                for fid, fuid in rows:
-                    await _send_single_video_with_fallback(chat_id, fid, fuid, "", context, name)
-                    await asyncio.sleep(0.4)
+    end_page = min(page + batch_pages - 1, total_pages)
+    start_idx = (page - 1) * GET_BATCH_SIZE
+    end_idx = min(start_idx + (end_page - page + 1) * GET_BATCH_SIZE, total)
 
-    start_idx = (page - 1) * GET_BATCH_SIZE + 1
-    end_idx = min(page * GET_BATCH_SIZE, total)
-    text = f"📦 *Collection:* `{name}`\n📄 *Page {page}/{total_pages}* (Videos {start_idx}-{end_idx} of {total})"
-
-    nav_row = []
-    if page > 1:
-        nav_row.append(InlineKeyboardButton("◀️ Prev", callback_data=f"getpage:{page-1}"))
-    nav_row.append(InlineKeyboardButton(f"🔄 Resend ({end_idx-start_idx+1})", callback_data=f"getsend:{page}"))
-    if page < total_pages:
-        nav_row.append(InlineKeyboardButton("Next ▶️", callback_data=f"getpage:{page+1}"))
-
-    jump_row = [
-        InlineKeyboardButton("⏪ -10", callback_data=f"getpage:{max(1, page-10)}"),
-        InlineKeyboardButton("🔢 Jump", callback_data="getjump:prompt"),
-        InlineKeyboardButton("+10 ⏩", callback_data=f"getpage:{min(total_pages, page+10)}"),
+    page_label = f"Page {page}/{total_pages}" if end_page == page else f"Pages {page}-{end_page}/{total_pages}"
+    text = (
+        f"📦 *Collection:* `{name}`\n"
+        f"{page_label} · Videos {start_idx + 1}-{end_idx} of {total}\n"
+        f"Prev/Next send {batch_pages} page(s) (~{end_idx - start_idx} videos) per tap"
+    )
+    keyboard = [
+        [
+            InlineKeyboardButton("◀️ Prev", callback_data="getprev"),
+            InlineKeyboardButton("🔢 Jump", callback_data="getjump"),
+            InlineKeyboardButton("Next ▶️", callback_data="getnext"),
+        ],
+        [InlineKeyboardButton(f"📚 Pages/tap: {batch_pages}", callback_data="getbatch")],
+        [InlineKeyboardButton("🛑 Cancel", callback_data="getcancel")],
     ]
 
-    keyboard = InlineKeyboardMarkup([
-        nav_row,
-        jump_row,
-        [InlineKeyboardButton("🛑 Close Menu", callback_data="getcancel")]
-    ])
+    try:
+        await msg.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    except TelegramError:
+        pass
 
-    if session.get("control_msg_id"):
-        try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=session["control_msg_id"])
-        except TelegramError:
-            pass
-
-    new_msg = await context.bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        reply_markup=keyboard,
-        parse_mode="Markdown",
-    )
-    session["control_msg_id"] = new_msg.message_id
-
-async def get_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _handle_get_nav(update: Update, context: ContextTypes.DEFAULT_TYPE, direction: str):
     query = update.callback_query
     await query.answer()
     chat_id = update.effective_chat.id
-    target_page = int(query.data.split(":")[1])
 
     session = _get_sessions.get(chat_id)
-    if session:
-        session["page"] = target_page
-        await _send_or_update_pagination(chat_id, context, send_videos_immediately=True)
+    if not session:
+        await query.edit_message_text("Session expired.")
+        return
+
+    file_rows, name, page, msg = session
+    total_pages = max(1, (len(file_rows) + GET_BATCH_SIZE - 1) // GET_BATCH_SIZE)
+    batch_pages = _get_batch_pages.get(chat_id, 1)
+
+    if direction == "next":
+        if page > total_pages:
+            await query.answer("Already at the end.", show_alert=True)
+            return
+        start_page = page
+    else:
+        start_page = max(1, page - 2 * batch_pages)
+    end_page = min(start_page + batch_pages - 1, total_pages)
+
+    try:
+        await msg.edit_text(f"🚀 Sending page(s) {start_page}-{end_page}...", parse_mode="Markdown")
+    except TelegramError:
+        pass
+
+    failed = await _send_pages(chat_id, file_rows, name, start_page, end_page, context)
+
+    new_page = min(end_page + 1, total_pages)
+    _get_sessions[chat_id] = (file_rows, name, new_page, msg)
+    if failed:
+        await context.bot.send_message(chat_id, f"⚠️ {failed} video(s) could not be sent (marked dead).")
+    await _render_get_page(chat_id, context)
+
+async def get_next_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _handle_get_nav(update, context, "next")
+
+async def get_prev_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _handle_get_nav(update, context, "prev")
+
+async def get_batch_toggle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat_id = update.effective_chat.id
+    current = _get_batch_pages.get(chat_id, 1)
+    new_val = current + 1 if current < GET_MAX_BATCH_PAGES else 1
+    _get_batch_pages[chat_id] = new_val
+    await query.answer(f"Now sending {new_val} page(s) per tap.")
+    await _render_get_page(chat_id, context)
 
 async def get_jump_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -823,57 +879,55 @@ async def get_jump_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     session = _get_sessions.get(chat_id)
     if not session:
+        await query.edit_message_text("Session expired.")
         return
 
-    total_pages = (session["total"] + GET_BATCH_SIZE - 1) // GET_BATCH_SIZE
-    context.user_data["awaiting_page_jump"] = True
+    file_rows, name, page, msg = session
+    total_pages = max(1, (len(file_rows) + GET_BATCH_SIZE - 1) // GET_BATCH_SIZE)
+    _awaiting_page_jump.add(chat_id)
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Cancel", callback_data="getcancel")]])
+    try:
+        await msg.edit_text(
+            f"🔢 Send the page number to jump to (1-{total_pages}) as a message.",
+            reply_markup=keyboard,
+        )
+    except TelegramError:
+        pass
 
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=f"🔢 *Jump to Page*\nPlease reply with a page number between `1` and `{total_pages}`:",
-        parse_mode="Markdown",
-    )
-
-async def handle_page_jump_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("awaiting_page_jump"):
-        return
-
+async def handle_get_page_jump_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    if chat_id not in _awaiting_page_jump:
+        return
+
     session = _get_sessions.get(chat_id)
     if not session:
-        context.user_data["awaiting_page_jump"] = False
+        _awaiting_page_jump.discard(chat_id)
         return
 
-    text = update.message.text.strip()
-    total_pages = (session["total"] + GET_BATCH_SIZE - 1) // GET_BATCH_SIZE
+    text = (update.message.text or "").strip()
+    file_rows, name, page, msg = session
+    total_pages = max(1, (len(file_rows) + GET_BATCH_SIZE - 1) // GET_BATCH_SIZE)
 
-    if text.isdigit():
-        target = int(text)
-        if 1 <= target <= total_pages:
-            context.user_data["awaiting_page_jump"] = False
-            session["page"] = target
-            await _send_or_update_pagination(chat_id, context, send_videos_immediately=True)
-            return
+    if not text.isdigit() or not (1 <= int(text) <= total_pages):
+        await update.message.reply_text(f"Please send a number between 1 and {total_pages}.")
+        return
 
-    await update.message.reply_text(f"⚠️ Invalid page number. Enter a number from 1 to {total_pages}:")
-
-async def get_send_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    chat_id = update.effective_chat.id
-    await _send_or_update_pagination(chat_id, context, send_videos_immediately=True)
+    target = int(text)
+    _awaiting_page_jump.discard(chat_id)
+    _get_sessions[chat_id] = (file_rows, name, target, msg)
+    try:
+        await update.message.delete()
+    except TelegramError:
+        pass
+    await _render_get_page(chat_id, context)
 
 async def get_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     chat_id = update.effective_chat.id
-
-    session = _get_sessions.pop(chat_id, None)
-    if session and session.get("control_msg_id"):
-        try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=session["control_msg_id"])
-        except TelegramError:
-            pass
+    _get_sessions.pop(chat_id, None)
+    _awaiting_page_jump.discard(chat_id)
+    await query.edit_message_text("Cancelled retrieval.")
 
 async def get_by_size(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pass
@@ -1307,6 +1361,7 @@ async def cancel_delete_callback(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
     await query.edit_message_text("❎ Deletion cancelled.")
+
 
 async def rename_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parsed = _parse_arrow_pair(context.args or [])
@@ -1934,6 +1989,16 @@ async def telegram_webhook(request):
         logger.exception("Error processing webhook update: %s", e)
         return Response(status_code=500)
 
+async def _filter_filter(update: Update) -> bool:
+    chat_id = update.effective_chat.id
+    min_len = min_video_length.get(chat_id)
+    if min_len is None:
+        return True
+    video = update.message.video
+    if video and video.duration is not None:
+        return video.duration >= min_len
+    return True
+
 # ----------------------------------------------------------------------
 # Application Initialization
 # ----------------------------------------------------------------------
@@ -2002,11 +2067,12 @@ app.add_handler(CallbackQueryHandler(list_random_callback, pattern="^listrandom:
 app.add_handler(CallbackQueryHandler(random_next_callback, pattern="^random_next:"))
 app.add_handler(CallbackQueryHandler(random_next_recursive_callback, pattern="^randomnextr:"))
 
-app.add_handler(CallbackQueryHandler(get_page_callback, pattern="^getpage:"))
-app.add_handler(CallbackQueryHandler(get_page_callback, pattern="^getstop:"))
-app.add_handler(CallbackQueryHandler(get_jump_callback, pattern="^getjump:"))
-app.add_handler(CallbackQueryHandler(get_send_callback, pattern="^getsend:"))
-app.add_handler(CallbackQueryHandler(get_cancel_callback, pattern="^getcancel:"))
+app.add_handler(CallbackQueryHandler(get_next_callback, pattern="^getnext$"))
+app.add_handler(CallbackQueryHandler(get_prev_callback, pattern="^getprev$"))
+app.add_handler(CallbackQueryHandler(get_batch_toggle_callback, pattern="^getbatch$"))
+app.add_handler(CallbackQueryHandler(get_jump_callback, pattern="^getjump$"))
+app.add_handler(CallbackQueryHandler(get_cancel_callback, pattern="^getcancel$"))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_get_page_jump_text))
 app.add_handler(CallbackQueryHandler(cleanupnow_callback, pattern="^cleanupnow:"))
 
 app.add_handler(CallbackQueryHandler(find_page_callback, pattern="^findpage:"))
@@ -2023,8 +2089,7 @@ app.add_handler(CallbackQueryHandler(neardup_delboth_callback, pattern="^nddelbo
 app.add_handler(CallbackQueryHandler(neardup_keep_callback, pattern="^ndkeep$"))
 app.add_handler(CallbackQueryHandler(neardup_close_callback, pattern="^ndclose:"))
 
-# Message Handlers
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_page_jump_input))
+# Video and file handlers
 app.add_handler(MessageHandler(filters.VIDEO, handle_video))
 app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 app.add_handler(MessageHandler(filters.PHOTO, handle_non_video))
