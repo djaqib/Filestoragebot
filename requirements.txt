@@ -2,3 +2,4 @@ python-telegram-bot[webhooks]==21.9
 psycopg2-binary==2.9.10
 starlette==0.38.5
 uvicorn==0.30.6
+fastapi>=0.110.0
