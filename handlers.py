@@ -2,7 +2,7 @@ import argparse
 import shlex
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
-
+from db import search_videos
 # ================================
 # KEYBOARDS & MENUS
 # ================================
@@ -72,12 +72,46 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles the /search command with optional duration and size flags."""
     try:
         args = shlex.split(" ".join(context.args))
     except ValueError:
         await update.message.reply_text("❌ Quote error. Make sure your quotes are closed properly.")
         return
+
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("query", nargs="*", default=[])
+    parser.add_argument("--min-duration", type=int, help="Min duration in seconds")
+    parser.add_argument("--max-duration", type=int, help="Max duration in seconds")
+    parser.add_argument("--min-size", type=float, help="Min size in MB")
+    parser.add_argument("--max-size", type=float, help="Max size in MB")
+
+    try:
+        parsed, _ = parser.parse_known_args(args)
+    except Exception:
+        await update.message.reply_text("❌ Invalid search flags format.")
+        return
+
+    search_query = " ".join(parsed.query).strip()
+
+    # Query PostgreSQL database
+    results = search_videos(
+        query=search_query if search_query else None,
+        min_duration=parsed.min_duration,
+        max_duration=parsed.max_duration,
+        min_size_mb=parsed.min_size,
+        max_size_mb=parsed.max_size
+    )
+
+    if not results:
+        await update.message.reply_text("❌ No videos found matching your criteria.")
+        return
+
+    # Format output message
+    response_text = f"<b>Found {len(results)} Video(s):</b>\n\n"
+    for vid in results:
+        response_text += f"• <b>{vid['title']}</b> ({vid['duration']}s | {round(vid['file_size'] / (1024*1024), 1)} MB)\n"
+
+    await update.message.reply_text(response_text, parse_mode="HTML")
 
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("query", nargs="*", default=[])
