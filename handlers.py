@@ -139,7 +139,11 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Format output message
     response_text = f"<b>Found {len(results)} Video(s):</b>\n\n"
     for vid in results:
-        response_text += f"• <b>{vid['title']}</b> ({vid['duration']}s | {round(vid['file_size'] / (1024*1024), 1)} MB)\n"
+        title = vid.get('title', 'Untitled Video')
+duration = vid.get('duration', 0)
+file_size = vid.get('file_size', 0)
+
+response_text += f"• <b>{title}</b> ({duration}s | {round(file_size / (1024*1024), 1)} MB)\n"
 
     await update.message.reply_text(response_text, parse_mode="HTML")
 
