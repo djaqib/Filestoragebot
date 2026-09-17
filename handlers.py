@@ -1,8 +1,40 @@
 import argparse
 import shlex
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import ContextTypes
+from telegram.ext import ContextTypes, ApplicationHandlerStop
 from db import search_videos
+
+# ================================
+# MIDDLEWARE / ACCESS CONTROL
+# ================================
+
+async def access_control(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Restricts bot access to authorized users and logs unauthorized access."""
+    user = update.effective_user
+    if not user:
+        return
+
+    allowed_ids = context.bot_data.get("allowed_user_ids", [])
+
+    # If ALLOWED_USER_IDS is set and user is not in the list, block them
+    if allowed_ids and user.id not in allowed_ids:
+        if update.message:
+            await update.message.reply_text("⛔ You are not authorized to use this bot.")
+
+        # Log breach attempt to ADMIN_LOG_CHANNEL if configured
+        admin_channel = context.bot_data.get("admin_log_channel")
+        if admin_channel:
+            log_msg = (
+                f"⚠️ <b>Unauthorized Access Attempt</b>\n"
+                f"User: {user.full_name} (@{user.username})\n"
+                f"ID: <code>{user.id}</code>"
+            )
+            await context.bot.send_message(chat_id=admin_channel, text=log_msg, parse_mode="HTML")
+
+        # Stop handlers from continuing execution
+        raise ApplicationHandlerStop
+
+
 # ================================
 # KEYBOARDS & MENUS
 # ================================
@@ -19,10 +51,7 @@ def get_main_menu() -> InlineKeyboardMarkup:
 
 
 def get_location_menu() -> InlineKeyboardMarkup:
-    """
-    Returns the actions menu for a specific location.
-    The redundant 'View Action Menu' button has been removed.
-    """
+    """Returns the actions menu for a specific location."""
     keyboard = [
         [
             InlineKeyboardButton("📁 Set Active", callback_data="set_active"),
@@ -72,6 +101,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles video searching via /search."""
     try:
         args = shlex.split(" ".join(context.args))
     except ValueError:
@@ -113,41 +143,13 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     await update.message.reply_text(response_text, parse_mode="HTML")
 
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("query", nargs="*", default=[])
-    parser.add_argument("--min-duration", type=int, help="Min duration in seconds")
-    parser.add_argument("--max-duration", type=int, help="Max duration in seconds")
-    parser.add_argument("--min-size", type=float, help="Min size in MB")
-    parser.add_argument("--max-size", type=float, help="Max size in MB")
-
-    try:
-        parsed, _ = parser.parse_known_args(args)
-    except Exception:
-        await update.message.reply_text("❌ Invalid search flags format.")
-        return
-
-    search_query = " ".join(parsed.query)
-    min_dur = parsed.min_duration
-    max_dur = parsed.max_duration
-    min_sz = parsed.min_size
-    max_sz = parsed.max_size
-
-    # Pass (search_query, min_dur, max_dur, min_sz, max_sz) into your db.py function here
-
-    response = (
-        f"🔍 <b>Searching for:</b> '{search_query if search_query else 'All'}'\n"
-        f"⏱️ <b>Duration:</b> {min_dur or 0}s to {max_dur or '∞'}s\n"
-        f"📦 <b>File Size:</b> {min_sz or 0}MB to {max_sz or '∞'}MB"
-    )
-    await update.message.reply_text(response, parse_mode="HTML")
-
 
 # ================================
 # CALLBACK QUERY HANDLER
 # ================================
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles inline keyboard interactions and smooth back-navigation."""
+    """Handles inline keyboard interactions."""
     query = update.callback_query
     await query.answer()
 
