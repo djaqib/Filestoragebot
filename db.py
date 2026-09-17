@@ -1,7 +1,6 @@
 import os
 import psycopg2
-from psycopg2.extras 
-import RealDictCursor
+from psycopg2.extras import RealDictCursor
 
 def get_db_connection():
     # Uses standard Postgres connection string (e.g., from Neon console)
@@ -13,6 +12,11 @@ def search_videos(query=None, min_duration=None, max_duration=None, min_size_mb=
 
     sql = "SELECT * FROM videos WHERE 1=1"
     params = []
+
+    # Optional keyword search across titles or tags if provided
+    if query:
+        sql += " AND (title ILIKE %s OR tags ILIKE %s)"
+        params.extend([f"%{query}%", f"%{query}%"])
 
     # Filter by duration (seconds)
     if min_duration is not None:
