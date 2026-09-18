@@ -198,6 +198,13 @@ def init_db():
                     collection TEXT PRIMARY KEY,
                     expiry_days INTEGER DEFAULT 0
                 );
+
+                CREATE TABLE IF NOT EXISTS neardup_ignored (
+                    collection TEXT NOT NULL,
+                    fuid_a TEXT NOT NULL,
+                    fuid_b TEXT NOT NULL,
+                    PRIMARY KEY (collection, fuid_a, fuid_b)
+                );
                 """
             )
     _db_call(_schema)
@@ -369,6 +376,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /stop - Stop tasks and pause saving\n\n"
         "📦 *Collection Operations*\n"
         "• /get [name] - Retrieve videos\n"
+        "   ◦ `--sort longest|shortest|largest|smallest` - sort by duration or file size\n"
         "• /list - Browse all collections\n"
         "• /random [name] - Send random video\n"
         "• /status - Video count for your active collection(s)\n"
@@ -672,15 +680,67 @@ async def list_random_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 # ----------------------------------------------------------------------
 # Retrieving Videos (Get / Pagination / Random / Search / Find)
 # ----------------------------------------------------------------------
+GET_SORT_MODES = {
+    "longest": "duration DESC NULLS LAST, added_at",
+    "shortest": "duration ASC NULLS LAST, added_at",
+    "largest": "file_size DESC NULLS LAST, added_at",
+    "smallest": "file_size ASC NULLS LAST, added_at",
+}
+
+def _parse_get_args(raw_text: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Parse the text after /get. Returns (name_or_None, sort_mode_or_None, error_or_None)."""
+    parts = raw_text.split(maxsplit=1)
+    remainder = parts[1] if len(parts) > 1 else ""
+    try:
+        tokens = shlex.split(remainder)
+    except ValueError:
+        return None, None, "Couldn't parse that — check your quotes."
+
+    sort_mode = None
+    name_tokens = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok.lower() == "--sort":
+            if i + 1 >= len(tokens):
+                return None, None, "Missing a value after --sort (longest/shortest/largest/smallest)."
+            val = tokens[i + 1].lower()
+            if val not in GET_SORT_MODES:
+                return None, None, f"Unknown sort '{val}'. Use: longest, shortest, largest, or smallest."
+            sort_mode = val
+            i += 2
+        else:
+            name_tokens.append(tok)
+            i += 1
+
+    name_str = " ".join(name_tokens) if name_tokens else None
+    return name_str, sort_mode, None
+
 async def get_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    name = normalize_name(" ".join(context.args)) if context.args else get_active_collections(chat_id)[0]
+
+    name_str = None
+    sort_mode = None
+    if update.message and update.message.text and update.message.text.startswith("/get"):
+        # Real /get command - parse full syntax including --sort.
+        name_str, sort_mode, err = _parse_get_args(update.message.text)
+        if err:
+            await update.message.reply_text(
+                f"⚠️ {err}\nUsage: /get [name] [--sort longest|shortest|largest|smallest]"
+            )
+            return
+    elif context.args:
+        # Invoked programmatically by a button callback with context.args already set.
+        name_str = " ".join(context.args)
+
+    name = normalize_name(name_str) if name_str else get_active_collections(chat_id)[0]
+    order_sql = GET_SORT_MODES.get(sort_mode, "added_at")
 
     try:
         def _fetch(conn):
             with conn.cursor() as cur:
                 clause, params = _under_clause(name)
-                cur.execute(f"SELECT file_id, file_unique_id FROM videos WHERE {clause} ORDER BY added_at", params)
+                cur.execute(f"SELECT file_id, file_unique_id FROM videos WHERE {clause} ORDER BY {order_sql}", params)
                 return cur.fetchall()
         rows = await db_run(_fetch)
     except Exception as e:
@@ -699,9 +759,10 @@ async def get_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total = len(file_rows)
     pages = (total + GET_BATCH_SIZE - 1) // GET_BATCH_SIZE
 
+    sort_label = f" (sorted: {sort_mode})" if sort_mode else ""
     session_msg = await context.bot.send_message(
         chat_id,
-        f"📦 Preparing to send {total} video(s) from `{name}` in pages...",
+        f"📦 Preparing to send {total} video(s) from `{name}`{sort_label} in pages...",
         parse_mode="Markdown",
     )
 
@@ -1630,6 +1691,12 @@ def _fetch_near_duplicates(collection: str) -> List[Tuple[Tuple[str, str, int, i
                 FROM videos v1
                 JOIN videos v2 ON v1.collection = v2.collection AND v1.id < v2.id
                 WHERE v1.collection = %s
+                  AND NOT EXISTS (
+                      SELECT 1 FROM neardup_ignored ni
+                      WHERE ni.collection = v1.collection
+                        AND ni.fuid_a = LEAST(v1.file_unique_id, v2.file_unique_id)
+                        AND ni.fuid_b = GREATEST(v1.file_unique_id, v2.file_unique_id)
+                  )
                   AND (
                     (
                       v1.duration IS NOT NULL AND v2.duration IS NOT NULL
@@ -1730,7 +1797,7 @@ async def _show_neardup_page(
             ],
             [
                 InlineKeyboardButton("Delete Both", callback_data=f"nddelboth:{t1}:{t2}"),
-                InlineKeyboardButton("Keep Both", callback_data="ndkeep"),
+                InlineKeyboardButton("Keep Both", callback_data=f"ndkeep:{t1}:{t2}"),
             ],
         ])
         if msg_b:
@@ -1810,7 +1877,30 @@ async def neardup_delboth_callback(update: Update, context: ContextTypes.DEFAULT
 async def neardup_keep_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text("👍 Kept both videos.")
+    token = query.data[len("ndkeep:"):]
+    try:
+        t1, t2 = token.split(":", 1)
+        fuid1, col1 = t1.split(":", 1)
+        fuid2, col2 = t2.split(":", 1)
+    except ValueError:
+        await query.edit_message_text("⚠️ Invalid action.")
+        return
+
+    a, b = sorted([fuid1, fuid2])
+
+    def _insert(conn):
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO neardup_ignored (collection, fuid_a, fuid_b) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+                (col1, a, b),
+            )
+    try:
+        await db_run(_insert)
+    except Exception as e:
+        await reply_db_error(update, "save keep-both decision", e)
+        return
+
+    await query.edit_message_text("👍 Kept both — this pair won't be shown again.")
 
 async def neardup_close_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2125,7 +2215,7 @@ app.add_handler(CallbackQueryHandler(cancel_delete_callback, pattern="^canceldel
 app.add_handler(CallbackQueryHandler(neardup_page_callback, pattern="^ndpage:"))
 app.add_handler(CallbackQueryHandler(neardup_del_callback, pattern="^nddel:"))
 app.add_handler(CallbackQueryHandler(neardup_delboth_callback, pattern="^nddelboth:"))
-app.add_handler(CallbackQueryHandler(neardup_keep_callback, pattern="^ndkeep$"))
+app.add_handler(CallbackQueryHandler(neardup_keep_callback, pattern="^ndkeep:"))
 app.add_handler(CallbackQueryHandler(neardup_close_callback, pattern="^ndclose:"))
 
 # Video and file handlers
