@@ -371,13 +371,18 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /get [name] - Retrieve videos\n"
         "• /list - Browse all collections\n"
         "• /random [name] - Send random video\n"
-        "• /status - Show active collection stats\n"
-        "• /info <name> - Detailed storage info\n"
+        "• /status - Video count for your active collection(s)\n"
+        "• /count <name> - Video count for any named collection\n"
+        "• /info <name> - Storage size, avg duration, first/last added\n"
         "• /delete <name> - Delete collection\n"
         "• /rename <old> -> <new> - Rename collection\n"
         "• /move <src> -> <dest> - Move videos\n"
         "• /copy <src> -> <dest> - Copy videos\n"
-        "• /merge <src> -> <dest> - Merge collections\n\n"
+        "• /merge <src> -> <dest> - Merge collections\n"
+        "• /remove - Reply to a video with this to delete just that video\n"
+        "• /removemode on|off - Auto-delete every video you forward instead of saving it\n"
+        "• /minlength <sec> - Ignore videos shorter than this when saving\n"
+        "• /setexpiry <name> <days> - Auto-delete a collection's videos after N days (0 disables) — admin only\n\n"
         "🔍 *Search*\n"
         "• `/search <query>` - keyword search by filename\n"
         "• Use quotes for a multi-word phrase: `/search \"long video\"`\n"
@@ -391,11 +396,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "   ◦ `/search --min-size 10 --max-size 100`\n"
         "   ◦ `/search \"long video\" --min-duration 600 --max-size 500`\n"
         "• Tap any result to receive that video.\n\n"
-        "🧹 *Other Utilities*\n"
-        "• /dups <name> - Find exact duplicates\n"
+        "🧹 *Cleanup*\n"
+        "• /dups <name> - Find exact duplicate videos\n"
         "• /neardupes <name> - Visual near-duplicate cleanup\n"
-        "• /removemode on|off - Toggle auto-delete mode\n"
-        "• /minlength <sec> - Filter short videos"
+        "• /cleanup <name> - Remove references to videos Telegram can no longer serve\n\n"
+        "💾 *Backup & Transfer*\n"
+        "• /export <name> - Export a plain-text list of file IDs\n"
+        "• /exportjson <name> - Export full video metadata as JSON\n"
+        "• /importjson - Reply to a JSON export file with this to re-import it — admin only\n"
+        "• /backup - Export the entire database as JSON — admin only"
     )
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
@@ -451,22 +460,20 @@ async def menu_folder_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 )
                 cols = [r[0] for r in cur.fetchall()]
                 subfolders = set()
-                exact_match = False
                 for c in cols:
-                    if c == folder_prefix:
-                        exact_match = True
-                    else:
+                    if c != folder_prefix:
                         rel = c[len(folder_prefix) + 1:]
                         subfolders.add(rel.split("/")[0])
-                return sorted(list(subfolders)), exact_match
-        subfolders, exact_match = await db_run(_get_sub_items)
+
+                cur.execute(f"SELECT COUNT(*) FROM videos WHERE {clause}", params)
+                total_videos = cur.fetchone()[0]
+                return sorted(list(subfolders)), total_videos
+        subfolders, total_videos = await db_run(_get_sub_items)
     except Exception as e:
         await reply_db_error(update, f"fetch items for '{folder_prefix}'", e)
         return
 
     keyboard = []
-    if exact_match:
-        keyboard.append([InlineKeyboardButton("📄 View exact collection", callback_data=f"menuview:{folder_prefix}")])
 
     for sf in subfolders:
         full_path = f"{folder_prefix}/{sf}"
@@ -483,32 +490,8 @@ async def menu_folder_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     keyboard.append([InlineKeyboardButton("⬅️ Back to Menu", callback_data="menu_back")])
 
     await query.edit_message_text(
-        f"📁 Folder: `{folder_prefix}`",
+        f"📁 Folder: `{folder_prefix}` — {total_videos} video(s)",
         reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown",
-    )
-
-async def menu_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    name = query.data[len("menuview:"):]
-
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📂 Set Active", callback_data=f"menuset:{name}"),
-            InlineKeyboardButton("🎲 Random Video", callback_data=f"menurandom:{name}"),
-        ],
-        [
-            InlineKeyboardButton("🗑️ Delete Folder/Collection", callback_data=f"listdelete:{name}"),
-        ],
-        [
-            InlineKeyboardButton("⬅️ Back to menu", callback_data="menu_back"),
-        ],
-    ])
-
-    await query.edit_message_text(
-        f"📁 Collection: `{name}`\nSelect an action:",
-        reply_markup=keyboard,
         parse_mode="Markdown",
     )
 
@@ -534,13 +517,6 @@ async def menu_set_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     active_collections[chat_id] = [name]
     await query.edit_message_text(f"✅ Active collection set to `{name}`", parse_mode="Markdown")
-
-async def menu_random_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    name = query.data[len("menurandom:"):]
-    context.args = [name]
-    await random_video(update, context)
 
 async def menu_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1696,7 +1672,7 @@ async def near_duplicates_command(update: Update, context: ContextTypes.DEFAULT_
     name = normalize_name(" ".join(context.args))
 
     try:
-        pairs = await db_run(lambda: _fetch_near_duplicates(name))
+        pairs = await asyncio.to_thread(_fetch_near_duplicates, name)
     except Exception as e:
         await reply_db_error(update, f"find near dupes in '{name}'", e)
         return
@@ -2125,8 +2101,6 @@ app.add_handler(CallbackQueryHandler(menu_folder_callback, pattern="^menufolder:
 app.add_handler(CallbackQueryHandler(menu_get_all_callback, pattern="^menugetall:"))
 app.add_handler(CallbackQueryHandler(menu_rand_all_callback, pattern="^menurandall:"))
 app.add_handler(CallbackQueryHandler(menu_set_callback, pattern="^menuset:"))
-app.add_handler(CallbackQueryHandler(menu_view_callback, pattern="^menuview:"))
-app.add_handler(CallbackQueryHandler(menu_random_callback, pattern="^menurandom:"))
 app.add_handler(CallbackQueryHandler(settings_callback, pattern="^settings:"))
 
 app.add_handler(CallbackQueryHandler(list_folder_callback, pattern="^listfolder:"))
@@ -2197,6 +2171,7 @@ async def main():
         BotCommand("finish", "Reset active collection to default"),
         BotCommand("stop", "Stop active processes and pause"),
         BotCommand("settings", "Open settings menu"),
+        BotCommand("neardupes", "Visual near-duplicate cleanup"),
         BotCommand("help", "Show help and command list"),
     ]
     await app.bot.set_my_commands(commands)
