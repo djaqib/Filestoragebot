@@ -63,10 +63,11 @@ GET_ALBUM_SEND_DELAY = 1.5
 NEARDUPES_PAIRS_PER_PAGE = 5
 NEARDUP_ALBUM_DELAY = 1.0
 SAVE_SUMMARY_DEBOUNCE_SECONDS = 2.5
+SAVE_PROGRESS_INTERVAL = 20
 
-NEAR_DUP_DURATION_TOLERANCE_SECONDS = 2
-NEAR_DUP_SIZE_TOLERANCE_FRACTION = 0.05
-NEAR_DUP_SIZE_ONLY_TOLERANCE_FRACTION = 0.02
+NEAR_DUP_DURATION_TOLERANCE_SECONDS = 1
+NEAR_DUP_SIZE_TOLERANCE_FRACTION = 0.015
+NEAR_DUP_SIZE_ONLY_TOLERANCE_FRACTION = 0.008
 
 # State Management
 active_collections: Dict[int, List[str]] = {}
@@ -271,6 +272,8 @@ async def _flush_save_summary(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         parts.append(f"🗑️ Removed {stats['removed']} video(s)")
     if stats["skipped"]:
         parts.append(f"↩️ Skipped {stats['skipped']} duplicate(s)")
+    if stats["failed"]:
+        parts.append(f"⚠️ {stats['failed']} failed")
     if not parts:
         return
 
@@ -281,10 +284,26 @@ async def _flush_save_summary(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     except TelegramError:
         pass
 
+async def _send_save_progress(chat_id: int, saved: int, skipped: int, failed: int, context: ContextTypes.DEFAULT_TYPE):
+    parts = [f"⏳ {saved} saved so far"]
+    if skipped:
+        parts.append(f"{skipped} skipped")
+    if failed:
+        parts.append(f"{failed} failed")
+    # Always a brand-new message (never edited in place) so it lands at the
+    # current bottom of the chat instead of getting buried above incoming videos.
+    try:
+        await context.bot.send_message(chat_id, " · ".join(parts) + "...")
+    except TelegramError:
+        pass
+
 def _record_activity(chat_id: int, collection: str, kind: str, context: ContextTypes.DEFAULT_TYPE):
-    stats = _save_counts.setdefault(chat_id, {"saved": 0, "skipped": 0, "removed": 0, "cols": set()})
+    stats = _save_counts.setdefault(chat_id, {"saved": 0, "skipped": 0, "removed": 0, "failed": 0, "cols": set()})
     stats[kind] += 1
     stats["cols"].add(collection)
+
+    if kind == "saved" and stats["saved"] % SAVE_PROGRESS_INTERVAL == 0:
+        asyncio.create_task(_send_save_progress(chat_id, stats["saved"], stats["skipped"], stats["failed"], context))
 
     existing = _save_notify_tasks.get(chat_id)
     if existing and not existing.done():
@@ -308,12 +327,16 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_remove = chat_id in removing_chats
 
     for col in collections:
-        if is_remove:
-            removed = await _delete_video_from_collection(col, video.file_unique_id)
-            _record_activity(chat_id, col, "removed" if removed else "skipped", context)
-        else:
-            saved = await _save_video_to_db(col, video.file_id, video.file_unique_id, video.duration, video.file_size, getattr(video, "file_name", None))
-            _record_activity(chat_id, col, "saved" if saved else "skipped", context)
+        try:
+            if is_remove:
+                removed = await _delete_video_from_collection(col, video.file_unique_id)
+                _record_activity(chat_id, col, "removed" if removed else "skipped", context)
+            else:
+                saved = await _save_video_to_db(col, video.file_id, video.file_unique_id, video.duration, video.file_size, getattr(video, "file_name", None))
+                _record_activity(chat_id, col, "saved" if saved else "skipped", context)
+        except Exception:
+            logger.exception("Failed to save/remove video in '%s'", col)
+            _record_activity(chat_id, col, "failed", context)
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -329,12 +352,16 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_remove = chat_id in removing_chats
 
     for col in collections:
-        if is_remove:
-            removed = await _delete_video_from_collection(col, doc.file_unique_id)
-            _record_activity(chat_id, col, "removed" if removed else "skipped", context)
-        else:
-            saved = await _save_video_to_db(col, doc.file_id, doc.file_unique_id, None, doc.file_size, doc.file_name)
-            _record_activity(chat_id, col, "saved" if saved else "skipped", context)
+        try:
+            if is_remove:
+                removed = await _delete_video_from_collection(col, doc.file_unique_id)
+                _record_activity(chat_id, col, "removed" if removed else "skipped", context)
+            else:
+                saved = await _save_video_to_db(col, doc.file_id, doc.file_unique_id, None, doc.file_size, doc.file_name)
+                _record_activity(chat_id, col, "saved" if saved else "skipped", context)
+        except Exception:
+            logger.exception("Failed to save/remove video in '%s'", col)
+            _record_activity(chat_id, col, "failed", context)
 
 async def handle_non_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pass
@@ -804,7 +831,7 @@ async def _send_pages(chat_id: int, file_rows: List[Tuple[str, str]], name: str,
             await asyncio.sleep(GET_ALBUM_SEND_DELAY)
     return failed
 
-async def _render_get_page(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+async def _render_get_page(chat_id: int, context: ContextTypes.DEFAULT_TYPE, as_new: bool = False):
     session = _get_sessions.get(chat_id)
     if not session:
         return
@@ -835,10 +862,26 @@ async def _render_get_page(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🛑 Cancel", callback_data="getcancel")],
     ]
 
-    try:
-        await msg.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-    except TelegramError:
-        pass
+    if as_new:
+        # The old control card is stale (videos were just sent below where it
+        # used to be) - drop it and send a fresh one so it lands at the
+        # current bottom of the chat instead of staying pinned above new content.
+        try:
+            await msg.delete()
+        except TelegramError:
+            pass
+        try:
+            new_msg = await context.bot.send_message(
+                chat_id, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
+            )
+            _get_sessions[chat_id] = (file_rows, name, page, new_msg)
+        except TelegramError:
+            pass
+    else:
+        try:
+            await msg.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        except TelegramError:
+            pass
 
 async def _handle_get_nav(update: Update, context: ContextTypes.DEFAULT_TYPE, direction: str):
     query = update.callback_query
@@ -863,18 +906,24 @@ async def _handle_get_nav(update: Update, context: ContextTypes.DEFAULT_TYPE, di
         start_page = max(1, page - 2 * batch_pages)
     end_page = min(start_page + batch_pages - 1, total_pages)
 
+    # Drop the old control card up front - Telegram's native "uploading"
+    # indicator covers feedback during the send, and this avoids a message
+    # that would otherwise sit stranded above the videos we're about to send.
     try:
-        await msg.edit_text(f"🚀 Sending page(s) {start_page}-{end_page}...", parse_mode="Markdown")
+        await msg.delete()
     except TelegramError:
         pass
 
     failed = await _send_pages(chat_id, file_rows, name, start_page, end_page, context)
 
     new_page = min(end_page + 1, total_pages)
-    _get_sessions[chat_id] = (file_rows, name, new_page, msg)
     if failed:
         await context.bot.send_message(chat_id, f"⚠️ {failed} video(s) could not be sent (marked dead).")
-    await _render_get_page(chat_id, context)
+
+    # Placeholder msg reference for the session - _render_get_page(as_new=True)
+    # sends the real message and overwrites this before anything reads it.
+    _get_sessions[chat_id] = (file_rows, name, new_page, msg)
+    await _render_get_page(chat_id, context, as_new=True)
 
 async def get_next_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _handle_get_nav(update, context, "next")
