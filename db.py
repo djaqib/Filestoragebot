@@ -1,21 +1,33 @@
-import os
+"""
+db.py - Database engine and standalone data-access functions.
+
+Handler-specific one-off queries stay inline in handlers.py (each still calls
+db_run/_under_clause from here) - only the shared engine and the handful of
+DB functions used from multiple places live in this module. Splitting every
+single inline query out into named functions here would mean rewriting ~40
+handler functions for little benefit; this keeps the split low-risk while
+still centralizing the actual database engine.
+"""
 import asyncio
 import logging
-from typing import Optional, Tuple, List
+from typing import List, Optional, Tuple
 
 import psycopg2
 
+from utils import (
+    DATABASE_URL,
+    NEAR_DUP_DURATION_TOLERANCE_SECONDS,
+    NEAR_DUP_SIZE_ONLY_TOLERANCE_FRACTION,
+    NEAR_DUP_SIZE_TOLERANCE_FRACTION,
+)
+
 logger = logging.getLogger(__name__)
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-NEAR_DUP_DURATION_TOLERANCE_SECONDS = 2
-NEAR_DUP_SIZE_TOLERANCE_FRACTION = 0.05
-NEAR_DUP_SIZE_ONLY_TOLERANCE_FRACTION = 0.02
-
-
+# ----------------------------------------------------------------------
+# Connection & Query Engine
+# ----------------------------------------------------------------------
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
-
 
 def _db_call(fn):
     conn = get_db_connection()
@@ -29,11 +41,12 @@ def _db_call(fn):
     finally:
         conn.close()
 
-
 async def db_run(fn):
     return await asyncio.to_thread(_db_call, fn)
 
-
+# ----------------------------------------------------------------------
+# Schema
+# ----------------------------------------------------------------------
 def init_db():
     def _schema(conn):
         with conn.cursor() as cur:
@@ -70,21 +83,36 @@ def init_db():
                     collection TEXT PRIMARY KEY,
                     expiry_days INTEGER DEFAULT 0
                 );
+
+                CREATE TABLE IF NOT EXISTS neardup_ignored (
+                    collection TEXT NOT NULL,
+                    fuid_a TEXT NOT NULL,
+                    fuid_b TEXT NOT NULL,
+                    PRIMARY KEY (collection, fuid_a, fuid_b)
+                );
                 """
             )
-
     _db_call(_schema)
     logger.info("Database schema initialized.")
 
+# ----------------------------------------------------------------------
+# Shared query-building helper
+# ----------------------------------------------------------------------
+def _under_clause(name: str) -> Tuple[str, Tuple[str, str]]:
+    """SQL fragment + params matching a collection or anything nested under it
+    (e.g. 'movies' also matches 'movies/action'). Always use this instead of
+    hand-writing a 'collection LIKE ... /%' clause: building the '/%' pattern
+    directly into the SQL text is what caused the repeated escaping bug,
+    since psycopg2 scans the whole query string for '%'. Passing the pattern
+    as a bound parameter instead avoids that entirely.
+    Usage: clause, params = _under_clause(name); cur.execute(f"... WHERE {clause}", params)
+    """
+    return "(collection = %s OR collection LIKE %s)", (name, f"{name}/%")
 
-async def save_video_to_db(
-    collection: str,
-    file_id: str,
-    file_unique_id: str,
-    duration: Optional[int],
-    file_size: Optional[int],
-    file_name: Optional[str],
-) -> bool:
+# ----------------------------------------------------------------------
+# Standalone data-access functions used from multiple handlers
+# ----------------------------------------------------------------------
+async def _save_video_to_db(collection: str, file_id: str, file_unique_id: str, duration: Optional[int], file_size: Optional[int], file_name: Optional[str]) -> bool:
     def _insert(conn):
         with conn.cursor() as cur:
             cur.execute(
@@ -96,23 +124,16 @@ async def save_video_to_db(
                 (collection, file_id, file_unique_id, duration, file_size, file_name),
             )
             return cur.rowcount > 0
-
     return await db_run(_insert)
 
-
-async def delete_video_from_collection(collection: str, file_unique_id: str) -> bool:
+async def _delete_video_from_collection(collection: str, file_unique_id: str) -> bool:
     def _delete(conn):
         with conn.cursor() as cur:
-            cur.execute(
-                "DELETE FROM videos WHERE collection = %s AND file_unique_id = %s",
-                (collection, file_unique_id),
-            )
+            cur.execute("DELETE FROM videos WHERE collection = %s AND file_unique_id = %s", (collection, file_unique_id))
             return cur.rowcount > 0
-
     return await db_run(_delete)
 
-
-def fetch_near_duplicates(collection: str) -> List[Tuple[Tuple[str, str, int, int], Tuple[str, str, int, int]]]:
+def _fetch_near_duplicates(collection: str) -> List[Tuple[Tuple[str, str, int, int], Tuple[str, str, int, int]]]:
     def _query(conn):
         with conn.cursor() as cur:
             cur.execute(
@@ -122,6 +143,12 @@ def fetch_near_duplicates(collection: str) -> List[Tuple[Tuple[str, str, int, in
                 FROM videos v1
                 JOIN videos v2 ON v1.collection = v2.collection AND v1.id < v2.id
                 WHERE v1.collection = %s
+                  AND NOT EXISTS (
+                      SELECT 1 FROM neardup_ignored ni
+                      WHERE ni.collection = v1.collection
+                        AND ni.fuid_a = LEAST(v1.file_unique_id, v2.file_unique_id)
+                        AND ni.fuid_b = GREATEST(v1.file_unique_id, v2.file_unique_id)
+                  )
                   AND (
                     (
                       v1.duration IS NOT NULL AND v2.duration IS NOT NULL
@@ -154,5 +181,4 @@ def fetch_near_duplicates(collection: str) -> List[Tuple[Tuple[str, str, int, in
                 v2 = (r[4], r[5], r[6], r[7])
                 pairs.append((v1, v2))
             return pairs
-
     return _db_call(_query)
